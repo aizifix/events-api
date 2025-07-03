@@ -1,9 +1,9 @@
 <?php
 
 $host = 'localhost';
-$dbname = 'db_event_planning';
+$dbname = 'es_v1';
 $username = 'root';
-$password = 'godisgood'; // password
+$password = ''; // password
 
 try {
     $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8", $username, $password);

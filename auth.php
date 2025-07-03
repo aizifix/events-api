@@ -181,28 +181,35 @@ class Auth {
                 ':user_contact' => $data['user_contact'],
                 ':username' => $data['username'],
                 ':password' => password_hash($data['password'], PASSWORD_DEFAULT),
-                ':role' => 'vendor'
+                ':role' => in_array($data['role'], ['client', 'organizer']) ? $data['role'] : 'client'
             ]);
 
             $userId = $this->conn->lastInsertId();
 
-            // Insert into tbl_vendor
-            $vendorSql = "INSERT INTO tbl_vendor (
-                user_id, vendor_address, vendor_contactNumber, vendor_registrationDate,
-                vendor_documents, vendor_notes
-            ) VALUES (
-                :userId, :vendorAddress, :vendorContactNumber, CURDATE(),
-                :vendorDocuments, :vendorNotes
-            )";
+            // Insert into tbl_vendor only if role is vendor (legacy support)
+            if (isset($data['role']) && $data['role'] === 'vendor') {
+                $vendorSql = "INSERT INTO tbl_vendor (
+                    user_id, vendor_address, vendor_contactNumber, vendor_registrationDate,
+                    vendor_documents, vendor_notes
+                ) VALUES (
+                    :userId, :vendorAddress, :vendorContactNumber, CURDATE(),
+                    :vendorDocuments, :vendorNotes
+                )";
 
-            $vendorStmt = $this->conn->prepare($vendorSql);
-            $vendorStmt->execute([
-                ':userId' => $userId,
-                ':vendorAddress' => $data['vendorAddress'],
-                ':vendorContactNumber' => $data['vendorContactNumber'],
-                ':vendorDocuments' => $data['vendorDocuments'] ?? null,
-                ':vendorNotes' => $data['vendorNotes'] ?? null
-            ]);
+                $vendorStmt = $this->conn->prepare($vendorSql);
+                $vendorStmt->execute([
+                    ':userId' => $userId,
+                    ':vendorAddress' => $data['vendorAddress'],
+                    ':vendorContactNumber' => $data['vendorContactNumber'],
+                    ':vendorDocuments' => $data['vendorDocuments'] ?? null,
+                    ':vendorNotes' => $data['vendorNotes'] ?? null
+                ]);
+            }
+
+            // Placeholder: Insert into tbl_organizer if role is organizer (if you have such a table)
+            // if (isset($data['role']) && $data['role'] === 'organizer') {
+            //     // Insert organizer-specific data here
+            // }
 
             $this->conn->commit();
             return json_encode(["status" => "success", "message" => "Registration successful!"]);
