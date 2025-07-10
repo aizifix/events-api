@@ -357,20 +357,33 @@ function createBooking($data) {
 
         // Create notification for admin (with error handling)
         try {
-            $notificationSql = "INSERT INTO tbl_notifications (
-                    user_id, booking_id, notification_message, notification_status
-                ) VALUES (
-                    (SELECT user_id FROM tbl_users WHERE user_role = 'admin' LIMIT 1),
-                    :booking_id,
-                    :notification_message,
-                    'unread'
-                )";
+            // Get first admin user ID
+            $adminStmt = $pdo->prepare("SELECT user_id FROM tbl_users WHERE user_role = 'admin' AND user_status = 'active' LIMIT 1");
+            $adminStmt->execute();
+            $adminUser = $adminStmt->fetch(PDO::FETCH_ASSOC);
 
-            $notificationStmt = $pdo->prepare($notificationSql);
-            $notificationStmt->bindParam(':booking_id', $bookingId, PDO::PARAM_INT);
-            $notificationMessage = 'New booking created: ' . $bookingReference;
-            $notificationStmt->bindParam(':notification_message', $notificationMessage, PDO::PARAM_STR);
-            $notificationStmt->execute();
+            if ($adminUser) {
+                $notificationSql = "CALL CreateNotification(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+                $notificationStmt = $pdo->prepare($notificationSql);
+                $notificationMessage = 'New booking ' . $bookingReference . ' has been created and requires your review.';
+
+                $notificationStmt->execute([
+                    $adminUser['user_id'],              // p_user_id
+                    'booking_created',                  // p_notification_type
+                    'New Booking Created',              // p_title
+                    $notificationMessage,               // p_message
+                    'high',                             // p_priority
+                    'calendar-plus',                    // p_icon
+                    '/admin/bookings/' . $bookingId,    // p_url
+                    null,                               // p_event_id
+                    $bookingId,                         // p_booking_id
+                    null,                               // p_venue_id
+                    null,                               // p_store_id
+                    null,                               // p_budget_id
+                    null,                               // p_feedback_id
+                    72                                  // p_expires_hours (3 days)
+                ]);
+            }
         } catch (PDOException $notifError) {
             // Log notification error but don't fail the booking
             error_log("createBooking: Notification creation failed: " . $notifError->getMessage());

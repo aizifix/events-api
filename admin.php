@@ -33,6 +33,28 @@ class Admin {
             // Log the incoming data for debugging
             error_log("createEvent received data: " . json_encode($data));
 
+            // Filter input data to only include expected fields to prevent SQL injection of unknown columns
+            $allowedFields = [
+                'operation', 'original_booking_reference', 'user_id', 'admin_id', 'organizer_id',
+                'event_title', 'event_theme', 'event_description', 'event_type_id', 'guest_count',
+                'event_date', 'start_time', 'end_time', 'package_id', 'venue_id', 'total_budget',
+                'down_payment', 'payment_method', 'payment_schedule_type_id', 'reference_number',
+                'additional_notes', 'event_status', 'is_recurring', 'recurrence_rule',
+                'client_signature', 'finalized_at', 'event_attachments', 'payment_attachments',
+                'components', 'timeline'
+            ];
+
+            $filteredData = [];
+            foreach ($allowedFields as $field) {
+                if (isset($data[$field])) {
+                    $filteredData[$field] = $data[$field];
+                }
+            }
+
+            // Use filtered data from here on
+            $data = $filteredData;
+            error_log("createEvent filtered data: " . json_encode($data));
+
             $this->conn->beginTransaction();
 
             // Validate required event fields
@@ -53,7 +75,7 @@ class Admin {
             }
 
             // Check if admin exists
-            $adminCheck = $this->conn->prepare("SELECT user_id FROM tbl_users WHERE user_id = ? AND user_role = 'Admin'");
+            $adminCheck = $this->conn->prepare("SELECT user_id FROM tbl_users WHERE user_id = ? AND user_role = 'admin'");
             $adminCheck->execute([$data['admin_id']]);
             if (!$adminCheck->fetch()) {
                 return json_encode(["status" => "error", "message" => "Invalid admin_id: Admin user does not exist"]);
@@ -81,6 +103,64 @@ class Admin {
                 $venueCheck->execute([$data['venue_id']]);
                 if (!$venueCheck->fetch()) {
                     return json_encode(["status" => "error", "message" => "Invalid venue_id: Venue does not exist"]);
+                }
+            }
+
+            // Wedding-specific business rule validation
+            if ($data['event_type_id'] == 1) { // Wedding event
+                // Check if there's already a wedding on the same date
+                $weddingCheck = $this->conn->prepare("
+                    SELECT event_id, event_title
+                    FROM tbl_events
+                    WHERE event_date = ?
+                    AND event_type_id = 1
+                    AND event_status NOT IN ('cancelled', 'completed')
+                ");
+                $weddingCheck->execute([$data['event_date']]);
+                $existingWedding = $weddingCheck->fetch();
+
+                if ($existingWedding) {
+                    return json_encode([
+                        "status" => "error",
+                        "message" => "Business rule violation: Only one wedding is allowed per day. There is already a wedding scheduled on " . $data['event_date'] . "."
+                    ]);
+                }
+
+                // Check if there are other events on the same date (weddings cannot be scheduled alongside other events)
+                $otherEventsCheck = $this->conn->prepare("
+                    SELECT event_id, event_title, event_type_id
+                    FROM tbl_events
+                    WHERE event_date = ?
+                    AND event_type_id != 1
+                    AND event_status NOT IN ('cancelled', 'completed')
+                ");
+                $otherEventsCheck->execute([$data['event_date']]);
+                $otherEvents = $otherEventsCheck->fetchAll();
+
+                if (!empty($otherEvents)) {
+                    $eventTypes = array_unique(array_column($otherEvents, 'event_type_id'));
+                    return json_encode([
+                        "status" => "error",
+                        "message" => "Business rule violation: Weddings cannot be scheduled alongside other events. There are other events already scheduled on " . $data['event_date'] . "."
+                    ]);
+                }
+            } else {
+                // For non-wedding events, check if there's a wedding on the same date
+                $weddingCheck = $this->conn->prepare("
+                    SELECT event_id, event_title
+                    FROM tbl_events
+                    WHERE event_date = ?
+                    AND event_type_id = 1
+                    AND event_status NOT IN ('cancelled', 'completed')
+                ");
+                $weddingCheck->execute([$data['event_date']]);
+                $existingWedding = $weddingCheck->fetch();
+
+                if ($existingWedding) {
+                    return json_encode([
+                        "status" => "error",
+                        "message" => "Business rule violation: Other events cannot be scheduled on the same date as a wedding. There is already a wedding scheduled on " . $data['event_date'] . "."
+                    ]);
                 }
             }
 
@@ -1250,11 +1330,14 @@ class Admin {
                     e.event_date,
                     e.start_time,
                     e.end_time,
+                    e.event_type_id,
+                    et.event_name as event_type_name,
                     CONCAT(c.user_firstName, ' ', c.user_lastName) as client_name,
                     COALESCE(v.venue_title, 'TBD') as venue_name
                 FROM tbl_events e
                 LEFT JOIN tbl_users c ON e.user_id = c.user_id
                 LEFT JOIN tbl_venue v ON e.venue_id = v.venue_id
+                LEFT JOIN tbl_event_type et ON e.event_type_id = et.event_type_id
                 WHERE e.event_date = ?
                 AND e.event_status NOT IN ('cancelled', 'completed')
                 AND (
@@ -1279,6 +1362,9 @@ class Admin {
 
             // Format conflicts for frontend
             $formattedConflicts = [];
+            $hasWedding = false;
+            $hasOtherEvents = false;
+
             foreach ($conflicts as $conflict) {
                 $formattedConflicts[] = [
                     'event_id' => (int)$conflict['event_id'],
@@ -1286,13 +1372,24 @@ class Admin {
                     'event_date' => $conflict['event_date'],
                     'start_time' => $conflict['start_time'],
                     'end_time' => $conflict['end_time'],
+                    'event_type_id' => (int)$conflict['event_type_id'],
+                    'event_type_name' => $conflict['event_type_name'],
                     'client_name' => $conflict['client_name'] ?: 'Unknown Client',
                     'venue_name' => $conflict['venue_name'] ?: 'TBD'
                 ];
+
+                // Check for wedding conflicts (business rule: only one wedding per day)
+                if ($conflict['event_type_id'] == 1) {
+                    $hasWedding = true;
+                } else {
+                    $hasOtherEvents = true;
+                }
             }
 
             $response = [
                 'hasConflicts' => count($formattedConflicts) > 0,
+                'hasWedding' => $hasWedding,
+                'hasOtherEvents' => $hasOtherEvents,
                 'conflicts' => $formattedConflicts,
                 'totalConflicts' => count($formattedConflicts),
                 'checkDate' => $eventDate,
@@ -1303,6 +1400,8 @@ class Admin {
             return json_encode([
                 "status" => "success",
                 "hasConflicts" => $response['hasConflicts'],
+                "hasWedding" => $response['hasWedding'],
+                "hasOtherEvents" => $response['hasOtherEvents'],
                 "conflicts" => $response['conflicts']
             ]);
         } catch (Exception $e) {
@@ -1311,7 +1410,78 @@ class Admin {
                 "status" => "error",
                 "message" => "Failed to check event conflicts: " . $e->getMessage(),
                 "hasConflicts" => false,
+                "hasWedding" => false,
+                "hasOtherEvents" => false,
                 "conflicts" => []
+            ]);
+        }
+    }
+
+    public function getCalendarConflictData($startDate, $endDate) {
+        try {
+            $sql = "
+                SELECT
+                    e.event_date,
+                    e.event_type_id,
+                    et.event_name as event_type_name,
+                    COUNT(*) as event_count
+                FROM tbl_events e
+                LEFT JOIN tbl_event_type et ON e.event_type_id = et.event_type_id
+                WHERE e.event_date BETWEEN ? AND ?
+                AND e.event_status NOT IN ('cancelled', 'completed')
+                GROUP BY e.event_date, e.event_type_id, et.event_name
+                ORDER BY e.event_date
+            ";
+
+            $stmt = $this->pdo->prepare($sql);
+            $stmt->execute([$startDate, $endDate]);
+            $events = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            // Structure the data for frontend calendar
+            $calendarData = [];
+
+            foreach ($events as $event) {
+                $date = $event['event_date'];
+                $eventTypeId = (int)$event['event_type_id'];
+
+                if (!isset($calendarData[$date])) {
+                    $calendarData[$date] = [
+                        'hasWedding' => false,
+                        'hasOtherEvents' => false,
+                        'eventCount' => 0,
+                        'events' => []
+                    ];
+                }
+
+                $calendarData[$date]['eventCount'] += $event['event_count'];
+
+                if ($eventTypeId == 1) { // Wedding
+                    $calendarData[$date]['hasWedding'] = true;
+                } else {
+                    $calendarData[$date]['hasOtherEvents'] = true;
+                }
+
+                $calendarData[$date]['events'][] = [
+                    'event_type_id' => $eventTypeId,
+                    'event_type_name' => $event['event_type_name'],
+                    'count' => $event['event_count']
+                ];
+            }
+
+            return json_encode([
+                "status" => "success",
+                "calendarData" => $calendarData,
+                "dateRange" => [
+                    "startDate" => $startDate,
+                    "endDate" => $endDate
+                ]
+            ]);
+        } catch (Exception $e) {
+            error_log("getCalendarConflictData error: " . $e->getMessage());
+            return json_encode([
+                "status" => "error",
+                "message" => "Failed to get calendar conflict data: " . $e->getMessage(),
+                "calendarData" => []
             ]);
         }
     }
@@ -4861,20 +5031,20 @@ class Admin {
             // Create notification for the organizer
             $notificationSql = "INSERT INTO tbl_notifications (
                 user_id,
+                event_id,
                 notification_type,
-                title,
-                message,
-                related_id,
+                notification_title,
+                notification_message,
                 created_at
             ) VALUES (?, ?, ?, ?, ?, NOW())";
 
             $notificationStmt = $this->pdo->prepare($notificationSql);
             $notificationStmt->execute([
                 $event['user_id'],
+                $event['event_id'],
                 'event_finalized',
                 'Event Finalized',
-                "Your event '{$event['event_title']}' has been finalized. Please check your payment schedule for upcoming payments.",
-                $event['event_id']
+                "Your event '{$event['event_title']}' has been finalized. Please check your payment schedule for upcoming payments."
             ]);
 
             // Log the finalization activity
@@ -5094,6 +5264,11 @@ switch ($operation) {
         $endTime = $_GET['end_time'] ?? ($data['end_time'] ?? '');
         $excludeEventId = $_GET['exclude_event_id'] ?? ($data['exclude_event_id'] ?? null);
         echo $admin->checkEventConflicts($eventDate, $startTime, $endTime, $excludeEventId);
+        break;
+    case "getCalendarConflictData":
+        $startDate = $_GET['start_date'] ?? ($data['start_date'] ?? '');
+        $endDate = $_GET['end_date'] ?? ($data['end_date'] ?? '');
+        echo $admin->getCalendarConflictData($startDate, $endDate);
         break;
     case "getEventById":
         $eventId = $_GET['event_id'] ?? ($data['event_id'] ?? 0);
