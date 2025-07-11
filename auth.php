@@ -224,7 +224,8 @@ class Auth {
             return json_encode(["status" => "error", "message" => "Username and password are required."]);
         }
 
-        $sql = "SELECT * FROM tbl_users WHERE user_username = :username";
+        // Allow login by username or email
+        $sql = "SELECT * FROM tbl_users WHERE user_username = :username OR user_email = :username";
         $stmt = $this->conn->prepare($sql);
         $stmt->execute([':username' => $username]);
 
@@ -236,6 +237,11 @@ class Auth {
 
         if (!password_verify($password, $user['user_pwd'])) {
             return json_encode(["status" => "error", "message" => "Invalid password."]);
+        }
+
+        // Check account status
+        if (isset($user['account_status']) && $user['account_status'] !== 'active') {
+            return json_encode(["status" => "error", "message" => "Account is " . $user['account_status'] . ". Please contact support."]);
         }
 
         // Generate and send OTP
@@ -310,6 +316,18 @@ class Auth {
             $userStmt->execute([':user_id' => $user_id]);
             $user = $userStmt->fetch(PDO::FETCH_ASSOC);
 
+            // Check if password change is required
+            $forcePasswordChange = isset($user['force_password_change']) && $user['force_password_change'] == 1;
+
+            // Update last login timestamp
+            $this->conn->prepare("UPDATE tbl_users SET last_login = NOW() WHERE user_id = :user_id")
+                ->execute([':user_id' => $user_id]);
+
+            // Log supplier activity if user is a supplier
+            if ($user['user_role'] === 'supplier') {
+                $this->logSupplierLogin($user_id);
+            }
+
             // Normalize user role
             $user['user_role'] = ucfirst(strtolower($user['user_role']));
             unset($user['user_pwd']); // Remove password from response
@@ -318,17 +336,153 @@ class Auth {
             $this->conn->prepare("DELETE FROM tbl_2fa WHERE user_id = :user_id")
                 ->execute([':user_id' => $user_id]);
 
-            return json_encode([
+            $response = [
                 "status" => "success",
-                "message" => "Login successful!",
-                "user" => $user
-            ]);
+                "message" => $forcePasswordChange ? "Login successful! Password change required." : "Login successful!",
+                "user" => $user,
+                "force_password_change" => $forcePasswordChange
+            ];
+
+            // If supplier role, get additional supplier info
+            if ($user['user_role'] === 'supplier') {
+                $supplierStmt = $this->conn->prepare("SELECT supplier_id, business_name, onboarding_status FROM tbl_suppliers WHERE user_id = :user_id AND is_active = 1");
+                $supplierStmt->execute([':user_id' => $user_id]);
+                $supplier = $supplierStmt->fetch(PDO::FETCH_ASSOC);
+
+                if ($supplier) {
+                    $response['supplier_info'] = $supplier;
+                }
+            }
+
+            return json_encode($response);
         } catch (PDOException $e) {
             error_log("Database error: " . $e->getMessage());
             return json_encode([
                 "status" => "error",
                 "message" => "Database error: " . $e->getMessage()
             ]);
+        }
+    }
+
+    // Change password method (especially for forced password changes)
+    public function changePassword($userId, $currentPassword, $newPassword, $confirmPassword) {
+        try {
+            // Validate inputs
+            if (empty($newPassword) || empty($confirmPassword)) {
+                return json_encode(["status" => "error", "message" => "New password and confirmation are required"]);
+            }
+
+            if ($newPassword !== $confirmPassword) {
+                return json_encode(["status" => "error", "message" => "Password confirmation does not match"]);
+            }
+
+            if (strlen($newPassword) < 8) {
+                return json_encode(["status" => "error", "message" => "Password must be at least 8 characters long"]);
+            }
+
+            // Get current user
+            $userStmt = $this->conn->prepare("SELECT * FROM tbl_users WHERE user_id = :user_id");
+            $userStmt->execute([':user_id' => $userId]);
+            $user = $userStmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$user) {
+                return json_encode(["status" => "error", "message" => "User not found"]);
+            }
+
+            // For non-forced password changes, verify current password
+            if (!$user['force_password_change'] && !empty($currentPassword)) {
+                if (!password_verify($currentPassword, $user['user_pwd'])) {
+                    return json_encode(["status" => "error", "message" => "Current password is incorrect"]);
+                }
+            }
+
+            // Hash new password
+            $hashedPassword = password_hash($newPassword, PASSWORD_DEFAULT);
+
+            // Update password and clear force_password_change flag
+            $updateStmt = $this->conn->prepare("
+                UPDATE tbl_users
+                SET user_pwd = :password, force_password_change = 0, updated_at = NOW()
+                WHERE user_id = :user_id
+            ");
+
+            $updateStmt->execute([
+                ':password' => $hashedPassword,
+                ':user_id' => $userId
+            ]);
+
+            // Log supplier activity if user is a supplier
+            if ($user['user_role'] === 'supplier') {
+                $this->logSupplierPasswordChange($userId);
+            }
+
+            return json_encode([
+                "status" => "success",
+                "message" => "Password changed successfully"
+            ]);
+
+        } catch (PDOException $e) {
+            error_log("Password change error: " . $e->getMessage());
+            return json_encode([
+                "status" => "error",
+                "message" => "Failed to change password"
+            ]);
+        }
+    }
+
+    // Log supplier login activity
+    private function logSupplierLogin($userId) {
+        try {
+            // Get supplier ID
+            $supplierStmt = $this->conn->prepare("SELECT supplier_id FROM tbl_suppliers WHERE user_id = :user_id AND is_active = 1");
+            $supplierStmt->execute([':user_id' => $userId]);
+            $supplier = $supplierStmt->fetch(PDO::FETCH_ASSOC);
+
+            if ($supplier) {
+                $activityStmt = $this->conn->prepare("
+                    INSERT INTO tbl_supplier_activity (
+                        supplier_id, activity_type, activity_description, ip_address, user_agent, created_at
+                    ) VALUES (?, 'login', 'Supplier logged in', ?, ?, NOW())
+                ");
+
+                $activityStmt->execute([
+                    $supplier['supplier_id'],
+                    $_SERVER['REMOTE_ADDR'] ?? null,
+                    $_SERVER['HTTP_USER_AGENT'] ?? null
+                ]);
+            }
+        } catch (Exception $e) {
+            error_log("Failed to log supplier login: " . $e->getMessage());
+        }
+    }
+
+    // Log supplier password change activity
+    private function logSupplierPasswordChange($userId) {
+        try {
+            // Get supplier ID
+            $supplierStmt = $this->conn->prepare("SELECT supplier_id FROM tbl_suppliers WHERE user_id = :user_id AND is_active = 1");
+            $supplierStmt->execute([':user_id' => $userId]);
+            $supplier = $supplierStmt->fetch(PDO::FETCH_ASSOC);
+
+            if ($supplier) {
+                $activityStmt = $this->conn->prepare("
+                    INSERT INTO tbl_supplier_activity (
+                        supplier_id, activity_type, activity_description, ip_address, user_agent, created_at
+                    ) VALUES (?, 'password_changed', 'Password changed successfully', ?, ?, NOW())
+                ");
+
+                $activityStmt->execute([
+                    $supplier['supplier_id'],
+                    $_SERVER['REMOTE_ADDR'] ?? null,
+                    $_SERVER['HTTP_USER_AGENT'] ?? null
+                ]);
+
+                // Update supplier password_set_at timestamp
+                $this->conn->prepare("UPDATE tbl_suppliers SET password_set_at = NOW() WHERE supplier_id = ?")
+                    ->execute([$supplier['supplier_id']]);
+            }
+        } catch (Exception $e) {
+            error_log("Failed to log supplier password change: " . $e->getMessage());
         }
     }
 }
@@ -360,6 +514,13 @@ switch ($operation) {
         break;
     case "verify_otp":
         echo $auth->verifyOTP($_POST['user_id'] ?? $jsonData['user_id'], $_POST['otp'] ?? $jsonData['otp']);
+        break;
+    case "change_password":
+        $userId = $_POST['user_id'] ?? $jsonData['user_id'];
+        $currentPassword = $_POST['current_password'] ?? $jsonData['current_password'] ?? '';
+        $newPassword = $_POST['new_password'] ?? $jsonData['new_password'];
+        $confirmPassword = $_POST['confirm_password'] ?? $jsonData['confirm_password'];
+        echo $auth->changePassword($userId, $currentPassword, $newPassword, $confirmPassword);
         break;
     case "check_username":
         $jsonData = json_decode(file_get_contents("php://input"), true);

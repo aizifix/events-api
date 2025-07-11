@@ -494,6 +494,1204 @@ class Admin {
     }
 
     // Placeholder methods for missing functionality - these prevent fatal errors
+    // ==================== SUPPLIER MANAGEMENT ====================
+
+    // Create a new supplier (Admin only)
+    // Enhanced supplier creation with auto-generated credentials and email notification
+    public function createSupplier($data) {
+        try {
+            $this->conn->beginTransaction();
+
+            // Validate required fields
+            $required = ['business_name', 'contact_number', 'contact_email', 'supplier_type'];
+            foreach ($required as $field) {
+                if (empty($data[$field])) {
+                    throw new Exception("$field is required");
+                }
+            }
+
+            // Validate email format
+            if (!filter_var($data['contact_email'], FILTER_VALIDATE_EMAIL)) {
+                throw new Exception("Invalid email format");
+            }
+
+            // Check for duplicate business name or email
+            $checkStmt = $this->conn->prepare("SELECT supplier_id FROM tbl_suppliers WHERE (business_name = ? OR contact_email = ?) AND is_active = 1");
+            $checkStmt->execute([$data['business_name'], $data['contact_email']]);
+            if ($checkStmt->fetch()) {
+                throw new Exception("A supplier with this business name or email already exists");
+            }
+
+            // Check if email already exists in users table
+            $userEmailCheck = $this->conn->prepare("SELECT user_id FROM tbl_users WHERE user_email = ?");
+            $userEmailCheck->execute([$data['contact_email']]);
+            if ($userEmailCheck->fetch()) {
+                throw new Exception("An account with this email already exists");
+            }
+
+            $userId = null;
+            $tempPassword = null;
+
+            // Create user account for internal suppliers
+            if ($data['supplier_type'] === 'internal') {
+                // Generate secure random password
+                $tempPassword = $this->generateSecurePassword();
+                $hashedPassword = password_hash($tempPassword, PASSWORD_DEFAULT);
+
+                // Parse contact person or use business name
+                $nameParts = $this->parseContactPersonName($data['contact_person'] ?? $data['business_name']);
+
+                $userSql = "INSERT INTO tbl_users (
+                               user_firstName, user_lastName, user_email, user_contact,
+                               user_pwd, user_role, force_password_change, account_status, created_at
+                           ) VALUES (?, ?, ?, ?, ?, 'supplier', 1, 'active', NOW())";
+
+                $userStmt = $this->conn->prepare($userSql);
+                $userStmt->execute([
+                    $nameParts['firstName'],
+                    $nameParts['lastName'],
+                    $data['contact_email'],
+                    $data['contact_number'],
+                    $hashedPassword
+                ]);
+
+                $userId = $this->conn->lastInsertId();
+            }
+
+            // Insert supplier with existing table structure
+            $sql = "INSERT INTO tbl_suppliers (
+                        user_id, supplier_type, business_name, contact_number, contact_email,
+                        contact_person, business_address, agreement_signed, registration_docs,
+                        business_description, specialty_category, is_active, is_verified,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NOW())";
+
+            $stmt = $this->conn->prepare($sql);
+
+            $agreementSigned = isset($data['agreement_signed']) ? (int)$data['agreement_signed'] : 0;
+            $registrationDocs = isset($data['registration_docs']) ? json_encode($data['registration_docs']) : null;
+            $isVerified = isset($data['is_verified']) ? (int)$data['is_verified'] : 0;
+
+            $stmt->execute([
+                $userId,
+                $data['supplier_type'],
+                $data['business_name'],
+                $data['contact_number'],
+                $data['contact_email'],
+                $data['contact_person'] ?? null,
+                $data['business_address'] ?? null,
+                $agreementSigned,
+                $registrationDocs,
+                $data['business_description'] ?? null,
+                $data['specialty_category'] ?? null,
+                $isVerified
+            ]);
+
+            $supplierId = $this->conn->lastInsertId();
+
+            // Store temporary credentials for email sending
+            if ($tempPassword && $userId) {
+                $credentialSql = "INSERT INTO tbl_supplier_credentials (
+                                     supplier_id, user_id, temp_password_hash, expires_at, created_at
+                                 ) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL 7 DAY), NOW())";
+
+                $credentialStmt = $this->conn->prepare($credentialSql);
+                $credentialStmt->execute([$supplierId, $userId, password_hash($tempPassword, PASSWORD_DEFAULT)]);
+            }
+
+            // Log supplier creation activity
+            $this->logSupplierActivity($supplierId, 'created', 'Supplier account created by admin', null, [
+                'admin_id' => $data['admin_id'] ?? null,
+                'supplier_type' => $data['supplier_type']
+            ]);
+
+            // Handle document uploads if provided
+            if (isset($data['documents']) && is_array($data['documents'])) {
+                foreach ($data['documents'] as $document) {
+                    $this->saveSupplierDocument($supplierId, $document, $data['admin_id'] ?? null);
+                }
+            }
+
+            $this->conn->commit();
+
+            // Send welcome email for internal suppliers
+            $emailSent = false;
+            if ($data['supplier_type'] === 'internal' && $tempPassword) {
+                $emailSent = $this->sendSupplierWelcomeEmail(
+                    $data['contact_email'],
+                    $data['contact_person'] ?? $data['business_name'],
+                    $tempPassword,
+                    $supplierId
+                );
+            }
+
+            // Determine onboarding status based on created supplier
+            $onboardingStatus = 'pending';
+            if ($isVerified) {
+                $onboardingStatus = 'active';
+            } elseif ($agreementSigned) {
+                $onboardingStatus = 'verified';
+            }
+
+            return json_encode([
+                "status" => "success",
+                "message" => "Supplier created successfully" . ($emailSent ? " and welcome email sent" : ""),
+                "supplier_id" => $supplierId,
+                "user_id" => $userId,
+                "onboarding_status" => $onboardingStatus,
+                "email_sent" => $emailSent,
+                "credentials" => $tempPassword ? [
+                    "username" => $data['contact_email'], // Use email as username
+                    "password" => $tempPassword,
+                    "email_sent" => $emailSent
+                ] : null
+            ]);
+
+        } catch (Exception $e) {
+            $this->conn->rollback();
+            return json_encode(["status" => "error", "message" => $e->getMessage()]);
+        }
+    }
+
+    // Generate secure random password
+    private function generateSecurePassword($length = 12) {
+        $chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
+        $password = '';
+        $charLength = strlen($chars);
+
+        // Ensure at least one of each type
+        $password .= $chars[random_int(0, 25)]; // lowercase
+        $password .= $chars[random_int(26, 51)]; // uppercase
+        $password .= $chars[random_int(52, 61)]; // number
+        $password .= $chars[random_int(62, $charLength - 1)]; // special
+
+        // Fill the rest randomly
+        for ($i = 4; $i < $length; $i++) {
+            $password .= $chars[random_int(0, $charLength - 1)];
+        }
+
+        return str_shuffle($password);
+    }
+
+    // Parse contact person name into first and last name
+    private function parseContactPersonName($fullName) {
+        $nameParts = explode(' ', trim($fullName));
+        $firstName = $nameParts[0];
+        $lastName = count($nameParts) > 1 ? implode(' ', array_slice($nameParts, 1)) : 'Account';
+
+        return [
+            'firstName' => $firstName,
+            'lastName' => $lastName
+        ];
+    }
+
+    // Log supplier activity
+    private function logSupplierActivity($supplierId, $activityType, $description, $relatedId = null, $metadata = null) {
+        try {
+            $sql = "INSERT INTO tbl_supplier_activity (
+                        supplier_id, activity_type, activity_description, related_id, metadata,
+                        ip_address, user_agent, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())";
+
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute([
+                $supplierId,
+                $activityType,
+                $description,
+                $relatedId,
+                $metadata ? json_encode($metadata) : null,
+                $_SERVER['REMOTE_ADDR'] ?? null,
+                $_SERVER['HTTP_USER_AGENT'] ?? null
+            ]);
+        } catch (Exception $e) {
+            error_log("Failed to log supplier activity: " . $e->getMessage());
+        }
+    }
+
+    // Save supplier document
+    private function saveSupplierDocument($supplierId, $documentData, $uploadedBy) {
+        try {
+            if (!isset($documentData['file_name']) || !isset($documentData['file_path'])) {
+                return false;
+            }
+
+            $sql = "INSERT INTO tbl_supplier_documents (
+                        supplier_id, document_type, document_title, file_name, file_path,
+                        file_size, file_type, uploaded_by, is_active, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NOW())";
+
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute([
+                $supplierId,
+                $documentData['document_type'] ?? 'other',
+                $documentData['document_title'] ?? 'Uploaded Document',
+                $documentData['file_name'],
+                $documentData['file_path'],
+                $documentData['file_size'] ?? 0,
+                $documentData['file_type'] ?? null,
+                $uploadedBy
+            ]);
+
+            return true;
+        } catch (Exception $e) {
+            error_log("Failed to save supplier document: " . $e->getMessage());
+            return false;
+        }
+    }
+
+        // Send supplier welcome email with credentials
+    private function sendSupplierWelcomeEmail($email, $supplierName, $tempPassword, $supplierId) {
+        try {
+            require_once 'vendor/autoload.php';
+
+            $mail = new \PHPMailer\PHPMailer\PHPMailer(true);
+
+            // Use existing SMTP configuration from auth.php
+            $mail->isSMTP();
+            $mail->Host = 'smtp.gmail.com';
+            $mail->SMTPAuth = true;
+            $mail->Username = 'aizelartunlock@gmail.com';
+            $mail->Password = 'nhueuwnriexqdbpt';
+            $mail->SMTPSecure = 'tls';
+            $mail->Port = 587;
+
+            $mail->setFrom('aizelartunlock@gmail.com', 'Event Planning System');
+            $mail->addAddress($email, $supplierName);
+
+            $mail->isHTML(true);
+            $mail->Subject = '🎉 Welcome to Event Planning System – Supplier Portal Access Granted';
+
+            // Generate professional welcome email
+            $portalUrl = (isset($_SERVER['HTTPS']) ? 'https' : 'http') . '://' . $_SERVER['HTTP_HOST'] . '/supplier/login';
+
+            $mail->Body = $this->generateSupplierWelcomeEmailTemplate(
+                $supplierName,
+                $email,
+                $tempPassword,
+                $portalUrl
+            );
+
+            $mail->AltBody = $this->generateSupplierWelcomeEmailText(
+                $supplierName,
+                $email,
+                $tempPassword,
+                $portalUrl
+            );
+
+            $success = $mail->send();
+
+            // Log email activity
+            $this->logEmailActivity(
+                $email,
+                $supplierName,
+                'supplier_welcome',
+                $mail->Subject,
+                $success ? 'sent' : 'failed',
+                $success ? null : $mail->ErrorInfo,
+                null,
+                $supplierId
+            );
+
+            return $success;
+
+        } catch (Exception $e) {
+            error_log("Failed to send supplier welcome email: " . $e->getMessage());
+
+            // Log failed email attempt
+            $this->logEmailActivity(
+                $email,
+                $supplierName,
+                'supplier_welcome',
+                'Welcome Email Failed',
+                'failed',
+                $e->getMessage(),
+                null,
+                $supplierId
+            );
+
+            return false;
+        }
+    }
+
+    // Generate HTML email template for supplier welcome
+    private function generateSupplierWelcomeEmailTemplate($supplierName, $email, $tempPassword, $portalUrl) {
+        return '
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                    margin: 0;
+                    padding: 0;
+                    background-color: #f8fafc;
+                    line-height: 1.6;
+                }
+                .container {
+                    max-width: 600px;
+                    margin: 0 auto;
+                    background-color: #ffffff;
+                    border-radius: 12px;
+                    overflow: hidden;
+                    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+                }
+                .header {
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    padding: 40px 30px;
+                    text-align: center;
+                }
+                .header h1 {
+                    margin: 0;
+                    font-size: 28px;
+                    font-weight: 600;
+                }
+                .header p {
+                    margin: 10px 0 0 0;
+                    opacity: 0.9;
+                    font-size: 16px;
+                }
+                .content {
+                    padding: 40px 30px;
+                }
+                .welcome-message {
+                    font-size: 18px;
+                    color: #2d3748;
+                    margin-bottom: 30px;
+                }
+                .credentials-box {
+                    background-color: #f7fafc;
+                    border: 2px solid #e2e8f0;
+                    border-radius: 8px;
+                    padding: 24px;
+                    margin: 30px 0;
+                }
+                .credentials-title {
+                    font-size: 16px;
+                    font-weight: 600;
+                    color: #2d3748;
+                    margin-bottom: 16px;
+                }
+                .credential-item {
+                    margin-bottom: 12px;
+                }
+                .credential-label {
+                    font-weight: 500;
+                    color: #4a5568;
+                }
+                .credential-value {
+                    font-family: "Monaco", "Menlo", monospace;
+                    background-color: #edf2f7;
+                    padding: 8px 12px;
+                    border-radius: 4px;
+                    border: 1px solid #cbd5e0;
+                    font-size: 14px;
+                    color: #2d3748;
+                    margin-top: 4px;
+                    word-break: break-all;
+                }
+                .features-list {
+                    background-color: #f0fff4;
+                    border-left: 4px solid #48bb78;
+                    padding: 20px;
+                    margin: 30px 0;
+                }
+                .features-list h3 {
+                    color: #2f855a;
+                    margin-top: 0;
+                    font-size: 16px;
+                }
+                .features-list ul {
+                    margin: 12px 0;
+                    padding-left: 20px;
+                }
+                .features-list li {
+                    color: #2d3748;
+                    margin-bottom: 8px;
+                }
+                .security-notice {
+                    background-color: #fffbeb;
+                    border: 1px solid #f6e05e;
+                    border-radius: 8px;
+                    padding: 20px;
+                    margin: 30px 0;
+                }
+                .security-notice h3 {
+                    color: #d69e2e;
+                    margin-top: 0;
+                    font-size: 16px;
+                }
+                .security-notice ol {
+                    margin: 12px 0;
+                    padding-left: 20px;
+                }
+                .security-notice li {
+                    color: #744210;
+                    margin-bottom: 8px;
+                }
+                .cta-button {
+                    display: inline-block;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    text-decoration: none;
+                    padding: 14px 28px;
+                    border-radius: 8px;
+                    font-weight: 600;
+                    margin: 20px 0;
+                    text-align: center;
+                }
+                .footer {
+                    background-color: #2d3748;
+                    color: #a0aec0;
+                    padding: 30px;
+                    text-align: center;
+                    font-size: 14px;
+                }
+                .footer p {
+                    margin: 8px 0;
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="header">
+                    <h1>🎉 Welcome to Event Planning System</h1>
+                    <p>Supplier Portal Access Granted</p>
+                </div>
+
+                <div class="content">
+                    <div class="welcome-message">
+                        Dear <strong>' . htmlspecialchars($supplierName) . '</strong>,
+                    </div>
+
+                    <p>Congratulations! You are now officially onboarded as a partnered supplier of <strong>Event Planning System</strong>.</p>
+
+                    <div class="features-list">
+                        <h3>🚀 As part of our supplier network, you can now:</h3>
+                        <ul>
+                            <li>Manage your service tiers and packages</li>
+                            <li>View assigned events and bookings</li>
+                            <li>Upload proposals and portfolio items</li>
+                            <li>Track payment schedules and earnings</li>
+                            <li>Receive client feedback and ratings</li>
+                            <li>Access comprehensive analytics dashboard</li>
+                        </ul>
+                    </div>
+
+                    <div class="credentials-box">
+                        <div class="credentials-title">🔐 Your Login Credentials:</div>
+                        <div class="credential-item">
+                            <div class="credential-label">Username/Email:</div>
+                            <div class="credential-value">' . htmlspecialchars($email) . '</div>
+                        </div>
+                        <div class="credential-item">
+                            <div class="credential-label">Temporary Password:</div>
+                            <div class="credential-value">' . htmlspecialchars($tempPassword) . '</div>
+                        </div>
+                    </div>
+
+                    <div class="security-notice">
+                        <h3>🔒 Important Security Steps:</h3>
+                        <ol>
+                            <li>Log in to the Supplier Portal using the link below</li>
+                            <li><strong>Change your password immediately</strong> after first login</li>
+                            <li>Keep your credentials private and secure</li>
+                            <li>Enable two-factor authentication if available</li>
+                        </ol>
+                    </div>
+
+                    <div style="text-align: center;">
+                        <a href="' . htmlspecialchars($portalUrl) . '" class="cta-button">
+                            Access Supplier Portal →
+                        </a>
+                    </div>
+
+                    <p><strong>Important:</strong> Do not reply to this message. If you did not expect this access or have any questions, please contact our admin team immediately.</p>
+                </div>
+
+                <div class="footer">
+                    <p><strong>Event Planning System</strong></p>
+                    <p>Admin Team | support@eventplanning.com</p>
+                    <p>This is an automated message. Please do not reply.</p>
+                </div>
+            </div>
+        </body>
+        </html>';
+    }
+
+    // Generate plain text email for supplier welcome
+    private function generateSupplierWelcomeEmailText($supplierName, $email, $tempPassword, $portalUrl) {
+        return "
+WELCOME TO EVENT PLANNING SYSTEM - SUPPLIER PORTAL ACCESS GRANTED
+
+Dear {$supplierName},
+
+Congratulations! You are now officially onboarded as a partnered supplier of Event Planning System.
+
+As part of our supplier network, you can now:
+- Manage your service tiers and packages
+- View assigned events and bookings
+- Upload proposals and portfolio items
+- Track payment schedules and earnings
+- Receive client feedback and ratings
+- Access comprehensive analytics dashboard
+
+YOUR LOGIN CREDENTIALS:
+Username/Email: {$email}
+Temporary Password: {$tempPassword}
+
+IMPORTANT SECURITY STEPS:
+1. Log in to the Supplier Portal at: {$portalUrl}
+2. Change your password immediately after first login
+3. Keep your credentials private and secure
+4. Enable two-factor authentication if available
+
+Do not reply to this message. If you did not expect this access or have any questions, please contact our admin team immediately.
+
+Regards,
+Event Planning System Admin Team
+support@eventplanning.com
+
+This is an automated message. Please do not reply.
+        ";
+    }
+
+    // Log email activity
+    private function logEmailActivity($recipientEmail, $recipientName, $emailType, $subject, $status, $errorMessage = null, $userId = null, $supplierId = null) {
+        try {
+            $sql = "INSERT INTO tbl_email_logs (
+                        recipient_email, recipient_name, email_type, subject, sent_status,
+                        sent_at, error_message, related_user_id, related_supplier_id, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())";
+
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute([
+                $recipientEmail,
+                $recipientName,
+                $emailType,
+                $subject,
+                $status,
+                $status === 'sent' ? date('Y-m-d H:i:s') : null,
+                $errorMessage,
+                $userId,
+                $supplierId
+            ]);
+        } catch (Exception $e) {
+            error_log("Failed to log email activity: " . $e->getMessage());
+        }
+    }
+
+    // Get all suppliers with pagination and filtering (Admin view)
+    public function getAllSuppliers($page = 1, $limit = 20, $filters = []) {
+        try {
+            $offset = ($page - 1) * $limit;
+
+            $whereClauses = ["s.is_active = 1"];
+            $params = [];
+
+            // Apply filters
+            if (!empty($filters['supplier_type'])) {
+                $whereClauses[] = "s.supplier_type = ?";
+                $params[] = $filters['supplier_type'];
+            }
+
+            if (!empty($filters['specialty_category'])) {
+                $whereClauses[] = "s.specialty_category = ?";
+                $params[] = $filters['specialty_category'];
+            }
+
+            if (!empty($filters['is_verified'])) {
+                $whereClauses[] = "s.is_verified = ?";
+                $params[] = (int)$filters['is_verified'];
+            }
+
+            if (!empty($filters['onboarding_status'])) {
+                switch ($filters['onboarding_status']) {
+                    case 'active':
+                        $whereClauses[] = "s.is_verified = 1";
+                        break;
+                    case 'verified':
+                        $whereClauses[] = "s.is_verified = 0 AND s.agreement_signed = 1";
+                        break;
+                    case 'pending':
+                        $whereClauses[] = "s.is_verified = 0 AND s.agreement_signed = 0";
+                        break;
+                    case 'documents_uploaded':
+                        $whereClauses[] = "s.is_verified = 0 AND s.agreement_signed = 0";
+                        break;
+                    case 'suspended':
+                        $whereClauses[] = "s.is_active = 0";
+                        break;
+                }
+            }
+
+            if (!empty($filters['search'])) {
+                $whereClauses[] = "(s.business_name LIKE ? OR s.contact_person LIKE ? OR s.contact_email LIKE ?)";
+                $searchTerm = "%" . $filters['search'] . "%";
+                $params[] = $searchTerm;
+                $params[] = $searchTerm;
+                $params[] = $searchTerm;
+            }
+
+            $whereSQL = "WHERE " . implode(" AND ", $whereClauses);
+
+            // Get total count
+            $countSql = "SELECT COUNT(*) as total FROM tbl_suppliers s $whereSQL";
+            $countStmt = $this->conn->prepare($countSql);
+            $countStmt->execute($params);
+            $totalResult = $countStmt->fetch();
+            $total = $totalResult['total'];
+
+            // Get suppliers with basic information first (simplified query for debugging)
+            $sql = "SELECT s.*
+                    FROM tbl_suppliers s
+                    $whereSQL
+                    ORDER BY s.created_at DESC
+                    LIMIT ? OFFSET ?";
+
+            $stmt = $this->conn->prepare($sql);
+            $params[] = $limit;
+            $params[] = $offset;
+
+            // Debug logging (commented out for production)
+            // error_log("getAllSuppliers SQL: " . $sql);
+            // error_log("getAllSuppliers params: " . print_r($params, true));
+
+            $stmt->execute($params);
+
+            $suppliers = [];
+            while ($row = $stmt->fetch()) {
+                // Parse registration docs
+                $row['registration_docs'] = $row['registration_docs'] ? json_decode($row['registration_docs'], true) : [];
+
+                // Set default values for missing fields
+                $row['total_offers'] = 0;
+                $row['total_bookings'] = 0;
+                $row['total_ratings'] = $row['total_ratings'] ?? 0;
+                $row['total_documents'] = 0;
+
+                // Set default onboarding status based on existing fields
+                if ($row['is_verified']) {
+                    $row['onboarding_status'] = 'active';
+                } elseif ($row['agreement_signed']) {
+                    $row['onboarding_status'] = 'verified';
+                } else {
+                    $row['onboarding_status'] = 'pending';
+                }
+
+                // Set default values for other missing fields
+                $row['last_activity'] = $row['updated_at'] ?? $row['created_at'];
+
+                $suppliers[] = $row;
+            }
+
+            // Debug logging (commented out for production)
+            // error_log("getAllSuppliers found " . count($suppliers) . " suppliers");
+            // if (count($suppliers) > 0) {
+            //     error_log("First supplier: " . print_r($suppliers[0], true));
+            // }
+
+            return json_encode([
+                "status" => "success",
+                "suppliers" => $suppliers,
+                "pagination" => [
+                    "current_page" => $page,
+                    "total_pages" => ceil($total / $limit),
+                    "total_records" => $total,
+                    "limit" => $limit
+                ]
+            ]);
+
+        } catch (Exception $e) {
+            return json_encode(["status" => "error", "message" => $e->getMessage()]);
+        }
+    }
+
+    // Get supplier by ID with complete details (Admin view)
+    public function getSupplierById($supplierId) {
+        try {
+            $sql = "SELECT s.*,
+                           u.user_firstName, u.user_lastName, u.user_email as user_account_email
+                    FROM tbl_suppliers s
+                    LEFT JOIN tbl_users u ON s.user_id = u.user_id
+                    WHERE s.supplier_id = ? AND s.is_active = 1";
+
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute([$supplierId]);
+            $supplier = $stmt->fetch();
+
+            if (!$supplier) {
+                return json_encode(["status" => "error", "message" => "Supplier not found"]);
+            }
+
+            $supplier['registration_docs'] = $supplier['registration_docs'] ? json_decode($supplier['registration_docs'], true) : [];
+
+            // Get supplier offers with subcomponents
+            $offersSql = "SELECT so.*,
+                                 GROUP_CONCAT(CONCAT(sc.component_title, '|', sc.component_description, '|', sc.is_customizable) SEPARATOR ';;') as subcomponents
+                          FROM tbl_supplier_offers so
+                          LEFT JOIN tbl_offer_subcomponents sc ON so.offer_id = sc.offer_id AND sc.is_active = 1
+                          WHERE so.supplier_id = ? AND so.is_active = 1
+                          GROUP BY so.offer_id
+                          ORDER BY so.tier_level ASC, so.created_at DESC";
+            $offersStmt = $this->conn->prepare($offersSql);
+            $offersStmt->execute([$supplierId]);
+
+            $offers = [];
+            while ($offer = $offersStmt->fetch()) {
+                $offer['offer_attachments'] = $offer['offer_attachments'] ? json_decode($offer['offer_attachments'], true) : [];
+
+                // Parse subcomponents
+                $subcomponents = [];
+                if ($offer['subcomponents']) {
+                    $components = explode(';;', $offer['subcomponents']);
+                    foreach ($components as $comp) {
+                        $parts = explode('|', $comp);
+                        if (count($parts) >= 3) {
+                            $subcomponents[] = [
+                                'title' => $parts[0],
+                                'description' => $parts[1],
+                                'is_customizable' => (bool)$parts[2]
+                            ];
+                        }
+                    }
+                }
+                $offer['subcomponents'] = $subcomponents;
+                unset($offer['subcomponents_raw']);
+
+                $offers[] = $offer;
+            }
+            $supplier['offers'] = $offers;
+
+            // Get supplier documents
+            $docsSql = "SELECT * FROM tbl_supplier_documents WHERE supplier_id = ? AND is_active = 1 ORDER BY created_at DESC";
+            $docsStmt = $this->conn->prepare($docsSql);
+            $docsStmt->execute([$supplierId]);
+
+            $documents = [];
+            while ($doc = $docsStmt->fetch()) {
+                $documents[] = $doc;
+            }
+            $supplier['documents'] = $documents;
+
+            // Get recent ratings with event details
+            $ratingsSql = "SELECT sr.*, u.user_firstName, u.user_lastName, e.event_title, ec.component_title
+                          FROM tbl_supplier_ratings sr
+                          LEFT JOIN tbl_users u ON sr.client_id = u.user_id
+                          LEFT JOIN tbl_events e ON sr.event_id = e.event_id
+                          LEFT JOIN tbl_event_components ec ON sr.event_component_id = ec.event_component_id
+                          WHERE sr.supplier_id = ? AND sr.is_public = 1
+                          ORDER BY sr.created_at DESC
+                          LIMIT 10";
+            $ratingsStmt = $this->conn->prepare($ratingsSql);
+            $ratingsStmt->execute([$supplierId]);
+
+            $ratings = [];
+            while ($rating = $ratingsStmt->fetch()) {
+                $rating['feedback_attachments'] = $rating['feedback_attachments'] ? json_decode($rating['feedback_attachments'], true) : [];
+                $ratings[] = $rating;
+            }
+            $supplier['recent_ratings'] = $ratings;
+
+            // Get supplier activity log
+            $activitySql = "SELECT * FROM tbl_supplier_activity WHERE supplier_id = ? ORDER BY created_at DESC LIMIT 20";
+            $activityStmt = $this->conn->prepare($activitySql);
+            $activityStmt->execute([$supplierId]);
+
+            $activities = [];
+            while ($activity = $activityStmt->fetch()) {
+                $activity['metadata'] = $activity['metadata'] ? json_decode($activity['metadata'], true) : [];
+                $activities[] = $activity;
+            }
+            $supplier['recent_activities'] = $activities;
+
+            return json_encode([
+                "status" => "success",
+                "supplier" => $supplier
+            ]);
+
+        } catch (Exception $e) {
+            return json_encode(["status" => "error", "message" => $e->getMessage()]);
+        }
+    }
+
+    // Update supplier (Admin only)
+    public function updateSupplier($supplierId, $data) {
+        try {
+            $this->conn->beginTransaction();
+
+            // Check if supplier exists
+            $checkStmt = $this->conn->prepare("SELECT user_id FROM tbl_suppliers WHERE supplier_id = ? AND is_active = 1");
+            $checkStmt->execute([$supplierId]);
+            $supplierData = $checkStmt->fetch();
+
+            if (!$supplierData) {
+                throw new Exception("Supplier not found");
+            }
+
+            // Update user account if exists and email is being changed
+            if ($supplierData['user_id'] && isset($data['contact_email'])) {
+                $userUpdateStmt = $this->conn->prepare("UPDATE tbl_users SET user_email = ? WHERE user_id = ?");
+                $userUpdateStmt->execute([$data['contact_email'], $supplierData['user_id']]);
+            }
+
+            // Build update query dynamically
+            $updateFields = [];
+            $params = [];
+
+            $allowedFields = [
+                'business_name', 'contact_number', 'contact_email', 'contact_person',
+                'business_address', 'agreement_signed', 'business_description',
+                'specialty_category', 'is_verified'
+            ];
+
+            foreach ($allowedFields as $field) {
+                if (isset($data[$field])) {
+                    $updateFields[] = "$field = ?";
+                    $params[] = $data[$field];
+                }
+            }
+
+            if (isset($data['registration_docs'])) {
+                $updateFields[] = "registration_docs = ?";
+                $params[] = json_encode($data['registration_docs']);
+            }
+
+            if (empty($updateFields)) {
+                throw new Exception("No fields to update");
+            }
+
+            $updateFields[] = "updated_at = NOW()";
+            $params[] = $supplierId;
+
+            $sql = "UPDATE tbl_suppliers SET " . implode(", ", $updateFields) . " WHERE supplier_id = ?";
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute($params);
+
+            $this->conn->commit();
+
+            return json_encode([
+                "status" => "success",
+                "message" => "Supplier updated successfully"
+            ]);
+
+        } catch (Exception $e) {
+            $this->conn->rollback();
+            return json_encode(["status" => "error", "message" => $e->getMessage()]);
+        }
+    }
+
+    // Delete supplier (Admin only - soft delete)
+    public function deleteSupplier($supplierId) {
+        try {
+            $stmt = $this->conn->prepare("UPDATE tbl_suppliers SET is_active = 0, updated_at = NOW() WHERE supplier_id = ?");
+            $stmt->execute([$supplierId]);
+
+            if ($stmt->rowCount() === 0) {
+                return json_encode(["status" => "error", "message" => "Supplier not found"]);
+            }
+
+            return json_encode([
+                "status" => "success",
+                "message" => "Supplier deleted successfully"
+            ]);
+
+        } catch (Exception $e) {
+            return json_encode(["status" => "error", "message" => $e->getMessage()]);
+        }
+    }
+
+    // Get supplier categories for filtering (Admin use)
+    public function getSupplierCategories() {
+        try {
+            $sql = "SELECT DISTINCT specialty_category
+                    FROM tbl_suppliers
+                    WHERE specialty_category IS NOT NULL AND is_active = 1
+                    ORDER BY specialty_category";
+
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute();
+
+            $categories = [];
+            while ($row = $stmt->fetch()) {
+                $categories[] = $row['specialty_category'];
+            }
+
+            return json_encode([
+                "status" => "success",
+                "categories" => $categories
+            ]);
+
+        } catch (Exception $e) {
+            return json_encode(["status" => "error", "message" => $e->getMessage()]);
+        }
+    }
+
+    // Get supplier statistics for admin dashboard
+    public function getSupplierStats() {
+        try {
+            $sql = "SELECT
+                        COUNT(*) as total_suppliers,
+                        SUM(CASE WHEN supplier_type = 'internal' THEN 1 ELSE 0 END) as internal_suppliers,
+                        SUM(CASE WHEN supplier_type = 'external' THEN 1 ELSE 0 END) as external_suppliers,
+                        SUM(CASE WHEN is_verified = 1 THEN 1 ELSE 0 END) as verified_suppliers,
+                        AVG(rating_average) as overall_avg_rating
+                    FROM tbl_suppliers
+                    WHERE is_active = 1";
+
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute();
+            $stats = $stmt->fetch();
+
+            // Get category breakdown
+            $categorySql = "SELECT specialty_category, COUNT(*) as count
+                           FROM tbl_suppliers
+                           WHERE is_active = 1 AND specialty_category IS NOT NULL
+                           GROUP BY specialty_category
+                           ORDER BY count DESC";
+
+            $categoryStmt = $this->conn->prepare($categorySql);
+            $categoryStmt->execute();
+
+            $categoryBreakdown = [];
+            while ($row = $categoryStmt->fetch()) {
+                $categoryBreakdown[] = $row;
+            }
+
+            $stats['category_breakdown'] = $categoryBreakdown;
+            $stats['overall_avg_rating'] = round($stats['overall_avg_rating'], 2);
+
+            return json_encode([
+                "status" => "success",
+                "stats" => $stats
+            ]);
+
+        } catch (Exception $e) {
+            return json_encode(["status" => "error", "message" => $e->getMessage()]);
+        }
+    }
+
+    // ==================== SUPPLIER DOCUMENT MANAGEMENT ====================
+
+    // Upload supplier document
+    public function uploadSupplierDocument($supplierId, $file, $documentType, $title, $uploadedBy) {
+        try {
+            // Validate inputs
+            if (empty($supplierId) || empty($file) || empty($documentType)) {
+                throw new Exception("Supplier ID, file, and document type are required");
+            }
+
+            // Validate document type
+            $allowedTypes = ['dti', 'business_permit', 'contract', 'portfolio', 'certification', 'other'];
+            if (!in_array($documentType, $allowedTypes)) {
+                throw new Exception("Invalid document type. Allowed: " . implode(', ', $allowedTypes));
+            }
+
+            // Validate file
+            $allowedExtensions = ['pdf', 'jpg', 'jpeg', 'png', 'doc', 'docx'];
+            $maxFileSize = 10 * 1024 * 1024; // 10MB
+
+            $fileExtension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+            if (!in_array($fileExtension, $allowedExtensions)) {
+                throw new Exception("Invalid file type. Allowed: " . implode(', ', $allowedExtensions));
+            }
+
+            if ($file['size'] > $maxFileSize) {
+                throw new Exception("File size exceeds 10MB limit");
+            }
+
+            // Create upload directory if it doesn't exist
+            $uploadDir = "uploads/supplier_documents/{$documentType}/";
+            if (!file_exists($uploadDir)) {
+                mkdir($uploadDir, 0755, true);
+            }
+
+            // Generate unique filename
+            $fileName = time() . '_' . preg_replace('/[^a-zA-Z0-9._-]/', '', $file['name']);
+            $filePath = $uploadDir . $fileName;
+
+            // Move uploaded file
+            if (!move_uploaded_file($file['tmp_name'], $filePath)) {
+                throw new Exception("Failed to upload file");
+            }
+
+            // Save to database
+            $sql = "INSERT INTO tbl_supplier_documents (
+                        supplier_id, document_type, document_title, file_name, file_path,
+                        file_size, file_type, uploaded_by, is_active, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, NOW())";
+
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute([
+                $supplierId,
+                $documentType,
+                $title,
+                $fileName,
+                $filePath,
+                $file['size'],
+                $file['type'],
+                $uploadedBy
+            ]);
+
+            $documentId = $this->conn->lastInsertId();
+
+            // Log activity
+            $this->logSupplierActivity($supplierId, 'document_uploaded',
+                "Uploaded document: {$title}", $documentId, [
+                    'document_type' => $documentType,
+                    'file_name' => $fileName,
+                    'file_size' => $file['size']
+                ]);
+
+            return json_encode([
+                "status" => "success",
+                "message" => "Document uploaded successfully",
+                "document_id" => $documentId,
+                "file_path" => $filePath
+            ]);
+
+        } catch (Exception $e) {
+            // Clean up file if database insert failed
+            if (isset($filePath) && file_exists($filePath)) {
+                unlink($filePath);
+            }
+            return json_encode(["status" => "error", "message" => $e->getMessage()]);
+        }
+    }
+
+    // Get supplier documents
+    public function getSupplierDocuments($supplierId, $documentType = null) {
+        try {
+            $whereClauses = ["sd.supplier_id = ?", "sd.is_active = 1"];
+            $params = [$supplierId];
+
+            if ($documentType) {
+                $whereClauses[] = "sd.document_type = ?";
+                $params[] = $documentType;
+            }
+
+            $whereSQL = "WHERE " . implode(" AND ", $whereClauses);
+
+            $sql = "SELECT sd.*, u.user_firstName, u.user_lastName,
+                           dt.type_name, dt.description as type_description
+                    FROM tbl_supplier_documents sd
+                    LEFT JOIN tbl_users u ON sd.uploaded_by = u.user_id
+                    LEFT JOIN tbl_document_types dt ON sd.document_type = dt.type_code
+                    {$whereSQL}
+                    ORDER BY sd.document_type ASC, sd.created_at DESC";
+
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute($params);
+
+            $documents = [];
+            while ($row = $stmt->fetch()) {
+                // Add file URL for download
+                $row['file_url'] = $this->generateSecureFileUrl($row['file_path']);
+                $row['file_size_formatted'] = $this->formatFileSize($row['file_size']);
+                $documents[] = $row;
+            }
+
+            return json_encode([
+                "status" => "success",
+                "documents" => $documents
+            ]);
+
+        } catch (Exception $e) {
+            return json_encode(["status" => "error", "message" => $e->getMessage()]);
+        }
+    }
+
+    // Verify supplier document
+    public function verifySupplierDocument($documentId, $verifiedBy, $status = 'verified', $notes = null) {
+        try {
+            $sql = "UPDATE tbl_supplier_documents
+                    SET is_verified = ?, verified_by = ?, verified_at = NOW(),
+                        verification_notes = ?, updated_at = NOW()
+                    WHERE document_id = ?";
+
+            $stmt = $this->conn->prepare($sql);
+            $isVerified = $status === 'verified' ? 1 : 0;
+            $stmt->execute([$isVerified, $verifiedBy, $notes, $documentId]);
+
+            if ($stmt->rowCount() === 0) {
+                throw new Exception("Document not found");
+            }
+
+            // Get document and supplier info for activity log
+            $docSql = "SELECT sd.*, s.supplier_id FROM tbl_supplier_documents sd
+                       JOIN tbl_suppliers s ON sd.supplier_id = s.supplier_id
+                       WHERE sd.document_id = ?";
+            $docStmt = $this->conn->prepare($docSql);
+            $docStmt->execute([$documentId]);
+            $document = $docStmt->fetch();
+
+            if ($document) {
+                $this->logSupplierActivity($document['supplier_id'], 'document_verified',
+                    "Document {$status}: {$document['document_title']}", $documentId, [
+                        'status' => $status,
+                        'verified_by' => $verifiedBy,
+                        'notes' => $notes
+                    ]);
+            }
+
+            return json_encode([
+                "status" => "success",
+                "message" => "Document {$status} successfully"
+            ]);
+
+        } catch (Exception $e) {
+            return json_encode(["status" => "error", "message" => $e->getMessage()]);
+        }
+    }
+
+    // Get document types for form
+    public function getDocumentTypes() {
+        try {
+            $sql = "SELECT * FROM tbl_document_types
+                    WHERE is_active = 1
+                    ORDER BY display_order ASC, type_name ASC";
+
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute();
+
+            $types = [];
+            while ($row = $stmt->fetch()) {
+                $row['allowed_extensions'] = json_decode($row['allowed_extensions'], true);
+                $types[] = $row;
+            }
+
+            return json_encode([
+                "status" => "success",
+                "document_types" => $types
+            ]);
+
+        } catch (Exception $e) {
+            return json_encode(["status" => "error", "message" => $e->getMessage()]);
+        }
+    }
+
+    // Generate secure file URL for document access
+    private function generateSecureFileUrl($filePath) {
+        // This should generate a secure, time-limited URL
+        // For now, return relative path - implement token-based access in production
+        return "/" . $filePath;
+    }
+
+    // Format file size for display
+    private function formatFileSize($bytes) {
+        if ($bytes >= 1073741824) {
+            return number_format($bytes / 1073741824, 2) . ' GB';
+        } elseif ($bytes >= 1048576) {
+            return number_format($bytes / 1048576, 2) . ' MB';
+        } elseif ($bytes >= 1024) {
+            return number_format($bytes / 1024, 2) . ' KB';
+        } else {
+            return $bytes . ' bytes';
+        }
+    }
+
     public function getAllVendors() { return json_encode(["status" => "error", "message" => "Method not implemented"]); }
     public function createPackage($data) {
         try {
@@ -5191,19 +6389,19 @@ if (!$pdo) {
 $rawInput = file_get_contents("php://input");
 $data = json_decode($rawInput, true);
 
-// Debug logging
-error_log("Admin.php - Raw input: " . $rawInput);
-error_log("Admin.php - Decoded data: " . json_encode($data));
-error_log("Admin.php - POST data: " . json_encode($_POST));
-error_log("Admin.php - GET data: " . json_encode($_GET));
+// Debug logging (commented out for production)
+// error_log("Admin.php - Raw input: " . $rawInput);
+// error_log("Admin.php - Decoded data: " . json_encode($data));
+// error_log("Admin.php - POST data: " . json_encode($_POST));
+// error_log("Admin.php - GET data: " . json_encode($_GET));
 
 // Check if operation is provided via GET or POST
 $operation = $_POST['operation'] ?? ($_GET['operation'] ?? ($data['operation'] ?? ''));
 
-error_log("Admin.php - Operation: " . $operation);
-error_log("Admin.php - All data: " . json_encode($data));
-error_log("Admin.php - POST: " . json_encode($_POST));
-error_log("Admin.php - GET: " . json_encode($_GET));
+// error_log("Admin.php - Operation: " . $operation);
+// error_log("Admin.php - All data: " . json_encode($data));
+// error_log("Admin.php - POST: " . json_encode($_POST));
+// error_log("Admin.php - GET: " . json_encode($_GET));
 
 $admin = new Admin($pdo);
 
@@ -5571,6 +6769,134 @@ switch ($operation) {
         $eventTypeId = $_GET['event_type_id'] ?? ($data['event_type_id'] ?? 0);
         echo $admin->getPackagesByEventType($eventTypeId);
         break;
+
+        // Supplier management operations
+    case "createSupplier":
+        // Handle FormData for file uploads
+        $supplierData = $_POST;
+
+        // Convert string booleans to actual booleans
+        if (isset($supplierData['agreement_signed'])) {
+            $supplierData['agreement_signed'] = ($supplierData['agreement_signed'] === 'true' || $supplierData['agreement_signed'] === '1');
+        }
+        if (isset($supplierData['is_verified'])) {
+            $supplierData['is_verified'] = ($supplierData['is_verified'] === 'true' || $supplierData['is_verified'] === '1');
+        }
+        if (isset($supplierData['send_email'])) {
+            $supplierData['send_email'] = ($supplierData['send_email'] === 'true' || $supplierData['send_email'] === '1');
+        }
+        if (isset($supplierData['create_user_account'])) {
+            $supplierData['create_user_account'] = ($supplierData['create_user_account'] === 'true' || $supplierData['create_user_account'] === '1');
+        }
+
+        // Handle file uploads - process files if they exist
+        if (!empty($_FILES)) {
+            $documents = [];
+            foreach ($_FILES as $fieldName => $file) {
+                if ($file['error'] === UPLOAD_ERR_OK) {
+                    // Extract document type from field name (e.g., documents[dti] -> dti)
+                    if (preg_match('/documents\[(.+)\]/', $fieldName, $matches)) {
+                        $documentType = $matches[1];
+
+                        // Create upload directory if it doesn't exist
+                        $uploadDir = 'uploads/supplier_documents/' . $documentType . '/';
+                        if (!file_exists($uploadDir)) {
+                            mkdir($uploadDir, 0755, true);
+                        }
+
+                        // Generate unique filename
+                        $fileExtension = pathinfo($file['name'], PATHINFO_EXTENSION);
+                        $fileName = uniqid() . '_' . time() . '.' . $fileExtension;
+                        $filePath = $uploadDir . $fileName;
+
+                        // Move uploaded file
+                        if (move_uploaded_file($file['tmp_name'], $filePath)) {
+                            $documents[] = [
+                                'document_type' => $documentType,
+                                'document_title' => $file['name'],
+                                'file_name' => $fileName,
+                                'file_path' => $filePath,
+                                'file_size' => $file['size'],
+                                'file_type' => $file['type']
+                            ];
+                        }
+                    }
+                }
+            }
+
+            if (!empty($documents)) {
+                $supplierData['documents'] = $documents;
+            }
+        }
+
+        echo $admin->createSupplier($supplierData);
+        break;
+    case "getAllSuppliers":
+        $page = (int)($_GET['page'] ?? 1);
+        $limit = (int)($_GET['limit'] ?? 20);
+        $filters = [
+            'supplier_type' => $_GET['supplier_type'] ?? '',
+            'specialty_category' => $_GET['specialty_category'] ?? '',
+            'is_verified' => $_GET['is_verified'] ?? '',
+            'onboarding_status' => $_GET['onboarding_status'] ?? '',
+            'search' => $_GET['search'] ?? ''
+        ];
+        echo $admin->getAllSuppliers($page, $limit, $filters);
+        break;
+    case "getSupplierById":
+        $supplierId = (int)($_GET['supplier_id'] ?? 0);
+        if ($supplierId <= 0) {
+            echo json_encode(["status" => "error", "message" => "Valid supplier ID required"]);
+        } else {
+            echo $admin->getSupplierById($supplierId);
+        }
+        break;
+    case "updateSupplier":
+        $supplierId = (int)($_GET['supplier_id'] ?? 0);
+        if ($supplierId <= 0) {
+            echo json_encode(["status" => "error", "message" => "Valid supplier ID required"]);
+        } else {
+            // Handle FormData for file uploads
+            $supplierData = $_POST;
+
+            // Convert string booleans to actual booleans
+            if (isset($supplierData['agreement_signed'])) {
+                $supplierData['agreement_signed'] = ($supplierData['agreement_signed'] === 'true' || $supplierData['agreement_signed'] === '1');
+            }
+            if (isset($supplierData['is_verified'])) {
+                $supplierData['is_verified'] = ($supplierData['is_verified'] === 'true' || $supplierData['is_verified'] === '1');
+            }
+
+            echo $admin->updateSupplier($supplierId, $supplierData);
+        }
+        break;
+    case "deleteSupplier":
+        $supplierId = (int)($_GET['supplier_id'] ?? 0);
+        if ($supplierId <= 0) {
+            echo json_encode(["status" => "error", "message" => "Valid supplier ID required"]);
+        } else {
+            echo $admin->deleteSupplier($supplierId);
+        }
+        break;
+    case "getSupplierCategories":
+        echo $admin->getSupplierCategories();
+        break;
+    case "getSupplierStats":
+        echo $admin->getSupplierStats();
+        break;
+    case "getSupplierDocuments":
+        $supplierId = (int)($_GET['supplier_id'] ?? 0);
+        $documentType = $_GET['document_type'] ?? null;
+        if ($supplierId <= 0) {
+            echo json_encode(["status" => "error", "message" => "Valid supplier ID required"]);
+        } else {
+            echo $admin->getSupplierDocuments($supplierId, $documentType);
+        }
+        break;
+    case "getDocumentTypes":
+        echo $admin->getDocumentTypes();
+        break;
+
     default:
         echo json_encode(["status" => "error", "message" => "Invalid action."]);
         break;

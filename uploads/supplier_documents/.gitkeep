@@ -1,0 +1,16 @@
+# Supplier Documents Upload Directory
+# This directory stores all supplier-related document uploads:
+# - DTI permits
+# - Business permits
+# - Contracts and agreements
+# - Portfolio documents
+# - Certifications
+# - Other miscellaneous documents
+
+# Directory structure:
+# /dti/ - DTI permits and registration documents
+# /permits/ - Business permits and licenses
+# /contracts/ - Signed contracts and agreements
+# /portfolios/ - Portfolio and work samples
+# /certifications/ - Professional certifications
+# /other/ - Miscellaneous documents
