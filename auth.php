@@ -51,7 +51,7 @@ class Auth {
             $mail->SMTPSecure = 'tls';
             $mail->Port = 587;
 
-            $mail->setFrom('your-email@gmail.com', 'Event Planning System');
+            $mail->setFrom('aizelartunlock@gmail.com', 'Event Planning System');
             $mail->addAddress($email);
 
             $mail->isHTML(true);
@@ -206,11 +206,6 @@ class Auth {
                 ]);
             }
 
-            // Placeholder: Insert into tbl_organizer if role is organizer (if you have such a table)
-            // if (isset($data['role']) && $data['role'] === 'organizer') {
-            //     // Insert organizer-specific data here
-            // }
-
             $this->conn->commit();
             return json_encode(["status" => "success", "message" => "Registration successful!"]);
         } catch (PDOException $e) {
@@ -225,9 +220,9 @@ class Auth {
         }
 
         // Allow login by username or email
-        $sql = "SELECT * FROM tbl_users WHERE user_username = :username OR user_email = :username";
+        $sql = "SELECT * FROM tbl_users WHERE user_username = :username OR user_email = :email";
         $stmt = $this->conn->prepare($sql);
-        $stmt->execute([':username' => $username]);
+        $stmt->execute([':username' => $username, ':email' => $username]);
 
         if ($stmt->rowCount() === 0) {
             return json_encode(["status" => "error", "message" => "User not found."]);

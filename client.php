@@ -211,6 +211,27 @@ function getPackageDetails($packageId) {
         $freebiesStmt->execute();
         $package['freebies'] = $freebiesStmt->fetchAll(PDO::FETCH_ASSOC);
 
+        // Get all venues for this package
+        $venuesSql = "SELECT v.venue_id, v.venue_title, v.venue_location,
+                            v.venue_capacity, v.venue_price as total_price,
+                            v.venue_profile_picture, v.venue_cover_photo
+                     FROM tbl_package_venues pv
+                     JOIN tbl_venue v ON pv.venue_id = v.venue_id
+                     WHERE pv.package_id = :package_id
+                     AND v.venue_status = 'available'
+                     ORDER BY v.venue_title ASC";
+        $venuesStmt = $pdo->prepare($venuesSql);
+        $venuesStmt->bindParam(':package_id', $packageId, PDO::PARAM_INT);
+        $venuesStmt->execute();
+        $package['venues'] = $venuesStmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Convert event type names to array
+        if ($package['event_type_names']) {
+            $package['event_type_names'] = explode(',', $package['event_type_names']);
+        } else {
+            $package['event_type_names'] = [];
+        }
+
         return ["status" => "success", "package" => $package];
     } catch (PDOException $e) {
         return ["status" => "error", "message" => "Database error: " . $e->getMessage()];
@@ -269,12 +290,15 @@ function createBooking($data) {
 
         $pdo->beginTransaction();
 
-        // Generate unique booking reference
+        // Generate unique booking reference with timestamp
         do {
             $bookingReference = 'BK-' . date('Ymd') . '-' . rand(1000, 9999);
             $checkRef = $pdo->prepare("SELECT COUNT(*) FROM tbl_bookings WHERE booking_reference = ?");
             $checkRef->execute([$bookingReference]);
         } while ($checkRef->fetchColumn() > 0);
+
+        // Get current timestamp for booking creation
+        $createdAt = date('Y-m-d H:i:s');
 
         // Check if the new columns exist in the table
         $columnCheckSql = "SHOW COLUMNS FROM tbl_bookings LIKE 'start_time'";
@@ -282,30 +306,38 @@ function createBooking($data) {
         $columnCheckStmt->execute();
         $hasNewColumns = $columnCheckStmt->rowCount() > 0;
 
-        error_log("createBooking: Has new columns: " . ($hasNewColumns ? 'yes' : 'no'));
+        // Check if created_at column exists
+        $createdAtCheckSql = "SHOW COLUMNS FROM tbl_bookings LIKE 'created_at'";
+        $createdAtCheckStmt = $pdo->prepare($createdAtCheckSql);
+        $createdAtCheckStmt->execute();
+        $hasCreatedAt = $createdAtCheckStmt->rowCount() > 0;
 
+        error_log("createBooking: Has new columns: " . ($hasNewColumns ? 'yes' : 'no'));
+        error_log("createBooking: Has created_at: " . ($hasCreatedAt ? 'yes' : 'no'));
+
+        // Build SQL query based on available columns
         if ($hasNewColumns) {
             // Use new schema with enhanced columns
-            $sql = "INSERT INTO tbl_bookings (
-                        booking_reference, user_id, event_type_id, event_name,
-                        event_date, event_time, start_time, end_time, guest_count, venue_id,
-                        package_id, notes, booking_status
-                    ) VALUES (
-                        :booking_reference, :user_id, :event_type_id, :event_name,
-                        :event_date, :event_time, :start_time, :end_time, :guest_count, :venue_id,
-                        :package_id, :notes, :booking_status
-                    )";
+            $columns = "booking_reference, user_id, event_type_id, event_name, event_date, event_time, start_time, end_time, guest_count, venue_id, package_id, notes, booking_status";
+            $values = ":booking_reference, :user_id, :event_type_id, :event_name, :event_date, :event_time, :start_time, :end_time, :guest_count, :venue_id, :package_id, :notes, :booking_status";
+
+            if ($hasCreatedAt) {
+                $columns .= ", created_at";
+                $values .= ", :created_at";
+            }
+
+            $sql = "INSERT INTO tbl_bookings ($columns) VALUES ($values)";
         } else {
             // Use legacy schema without new columns
-            $sql = "INSERT INTO tbl_bookings (
-                        booking_reference, user_id, event_type_id, event_name,
-                        event_date, event_time, guest_count, venue_id,
-                        package_id, notes
-                    ) VALUES (
-                        :booking_reference, :user_id, :event_type_id, :event_name,
-                        :event_date, :event_time, :guest_count, :venue_id,
-                        :package_id, :notes
-                    )";
+            $columns = "booking_reference, user_id, event_type_id, event_name, event_date, event_time, guest_count, venue_id, package_id, notes";
+            $values = ":booking_reference, :user_id, :event_type_id, :event_name, :event_date, :event_time, :guest_count, :venue_id, :package_id, :notes";
+
+            if ($hasCreatedAt) {
+                $columns .= ", created_at";
+                $values .= ", :created_at";
+            }
+
+            $sql = "INSERT INTO tbl_bookings ($columns) VALUES ($values)";
         }
 
         $stmt = $pdo->prepare($sql);
@@ -351,39 +383,31 @@ function createBooking($data) {
             $stmt->bindParam(':booking_status', $bookingStatus, PDO::PARAM_STR);
         }
 
+        // Bind created_at if column exists
+        if ($hasCreatedAt) {
+            $stmt->bindParam(':created_at', $createdAt, PDO::PARAM_STR);
+        }
+
         error_log("createBooking: Executing SQL with reference: " . $bookingReference);
         $stmt->execute();
         $bookingId = $pdo->lastInsertId();
 
         // Create notification for admin (with error handling)
         try {
-            // Get first admin user ID
-            $adminStmt = $pdo->prepare("SELECT user_id FROM tbl_users WHERE user_role = 'admin' AND user_status = 'active' LIMIT 1");
-            $adminStmt->execute();
-            $adminUser = $adminStmt->fetch(PDO::FETCH_ASSOC);
+            $notificationSql = "INSERT INTO tbl_notifications (
+                    user_id, booking_id, notification_message, notification_status
+                ) VALUES (
+                    (SELECT user_id FROM tbl_users WHERE user_role = 'admin' LIMIT 1),
+                    :booking_id,
+                    :notification_message,
+                    'unread'
+                )";
 
-            if ($adminUser) {
-                $notificationSql = "CALL CreateNotification(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-                $notificationStmt = $pdo->prepare($notificationSql);
-                $notificationMessage = 'New booking ' . $bookingReference . ' has been created and requires your review.';
-
-                $notificationStmt->execute([
-                    $adminUser['user_id'],              // p_user_id
-                    'booking_created',                  // p_notification_type
-                    'New Booking Created',              // p_title
-                    $notificationMessage,               // p_message
-                    'high',                             // p_priority
-                    'calendar-plus',                    // p_icon
-                    '/admin/bookings/' . $bookingId,    // p_url
-                    null,                               // p_event_id
-                    $bookingId,                         // p_booking_id
-                    null,                               // p_venue_id
-                    null,                               // p_store_id
-                    null,                               // p_budget_id
-                    null,                               // p_feedback_id
-                    72                                  // p_expires_hours (3 days)
-                ]);
-            }
+            $notificationStmt = $pdo->prepare($notificationSql);
+            $notificationStmt->bindParam(':booking_id', $bookingId, PDO::PARAM_INT);
+            $notificationMessage = 'New booking created: ' . $bookingReference;
+            $notificationStmt->bindParam(':notification_message', $notificationMessage, PDO::PARAM_STR);
+            $notificationStmt->execute();
         } catch (PDOException $notifError) {
             // Log notification error but don't fail the booking
             error_log("createBooking: Notification creation failed: " . $notifError->getMessage());
@@ -655,6 +679,238 @@ function getClientNextPayments($userId) {
     }
 }
 
+// Function to get all available packages for dashboard
+function getAllPackages() {
+    global $pdo;
+
+    try {
+        $sql = "SELECT p.*,
+                GROUP_CONCAT(DISTINCT et.event_name) as event_type_names,
+                COUNT(DISTINCT pv.venue_id) as venue_count,
+                COUNT(DISTINCT pc.component_id) as component_count,
+                COUNT(DISTINCT pf.freebie_id) as freebie_count
+                FROM tbl_packages p
+                LEFT JOIN tbl_package_event_types pet ON p.package_id = pet.package_id
+                LEFT JOIN tbl_event_type et ON pet.event_type_id = et.event_type_id
+                LEFT JOIN tbl_package_venues pv ON p.package_id = pv.package_id
+                LEFT JOIN tbl_package_components pc ON p.package_id = pc.package_id
+                LEFT JOIN tbl_package_freebies pf ON p.package_id = pf.package_id
+                WHERE p.is_active = 1
+                GROUP BY p.package_id
+                ORDER BY p.package_price ASC";
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute();
+        $packages = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // For each package, get limited preview data
+        foreach ($packages as &$package) {
+            // Get package components (limited for preview)
+            $componentsSql = "SELECT component_name, component_price
+                             FROM tbl_package_components
+                             WHERE package_id = :package_id
+                             ORDER BY display_order ASC
+                             LIMIT 5";
+            $componentsStmt = $pdo->prepare($componentsSql);
+            $componentsStmt->bindParam(':package_id', $package['package_id'], PDO::PARAM_INT);
+            $componentsStmt->execute();
+            $package['components'] = $componentsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+            // Get package freebies (limited for preview)
+            $freebiesSql = "SELECT freebie_name, freebie_description, freebie_value
+                           FROM tbl_package_freebies
+                           WHERE package_id = :package_id
+                           ORDER BY display_order ASC
+                           LIMIT 3";
+            $freebiesStmt = $pdo->prepare($freebiesSql);
+            $freebiesStmt->bindParam(':package_id', $package['package_id'], PDO::PARAM_INT);
+            $freebiesStmt->execute();
+            $package['freebies'] = $freebiesStmt->fetchAll(PDO::FETCH_ASSOC);
+
+            // Convert comma-separated values to arrays
+            if ($package['event_type_names']) {
+                $package['event_type_names'] = explode(',', $package['event_type_names']);
+            } else {
+                $package['event_type_names'] = [];
+            }
+
+            // Add creator name
+            $creatorSql = "SELECT CONCAT(user_firstName, ' ', user_lastName) as created_by_name
+                          FROM tbl_users
+                          WHERE user_id = :created_by";
+            $creatorStmt = $pdo->prepare($creatorSql);
+            $creatorStmt->bindParam(':created_by', $package['created_by'], PDO::PARAM_INT);
+            $creatorStmt->execute();
+            $creatorResult = $creatorStmt->fetch(PDO::FETCH_ASSOC);
+            $package['created_by_name'] = $creatorResult ? $creatorResult['created_by_name'] : 'Unknown';
+        }
+
+        return ["status" => "success", "packages" => $packages];
+    } catch (PDOException $e) {
+        return ["status" => "error", "message" => "Database error: " . $e->getMessage()];
+    }
+}
+
+// Function to check event conflicts
+function checkEventConflicts($eventDate, $startTime, $endTime, $excludeEventId = null) {
+    global $pdo;
+
+    try {
+        $sql = "
+            SELECT
+                e.event_id,
+                e.event_title,
+                e.event_date,
+                e.start_time,
+                e.end_time,
+                e.event_type_id,
+                et.event_name as event_type_name,
+                CONCAT(c.user_firstName, ' ', c.user_lastName) as client_name,
+                COALESCE(v.venue_title, 'TBD') as venue_name
+            FROM tbl_events e
+            LEFT JOIN tbl_users c ON e.user_id = c.user_id
+            LEFT JOIN tbl_venue v ON e.venue_id = v.venue_id
+            LEFT JOIN tbl_event_type et ON e.event_type_id = et.event_type_id
+            WHERE e.event_date = ?
+            AND e.event_status NOT IN ('cancelled', 'completed')
+            AND (
+                (e.start_time < ? AND e.end_time > ?) OR
+                (e.start_time < ? AND e.end_time > ?) OR
+                (e.start_time >= ? AND e.end_time <= ?)
+            )
+        ";
+
+        $params = [$eventDate, $endTime, $startTime, $endTime, $startTime, $startTime, $endTime];
+
+        if ($excludeEventId) {
+            $sql .= " AND e.event_id != ?";
+            $params[] = $excludeEventId;
+        }
+
+        $sql .= " ORDER BY e.start_time";
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($params);
+        $conflicts = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Format conflicts for frontend
+        $formattedConflicts = [];
+        $hasWedding = false;
+        $hasOtherEvents = false;
+
+        foreach ($conflicts as $conflict) {
+            $formattedConflicts[] = [
+                'event_id' => (int)$conflict['event_id'],
+                'event_title' => $conflict['event_title'],
+                'event_date' => $conflict['event_date'],
+                'start_time' => $conflict['start_time'],
+                'end_time' => $conflict['end_time'],
+                'event_type_id' => (int)$conflict['event_type_id'],
+                'event_type_name' => $conflict['event_type_name'],
+                'client_name' => $conflict['client_name'] ?: 'Unknown Client',
+                'venue_name' => $conflict['venue_name'] ?: 'TBD'
+            ];
+
+            // Check for wedding conflicts (business rule: only one wedding per day)
+            if ($conflict['event_type_id'] == 1) {
+                $hasWedding = true;
+            } else {
+                $hasOtherEvents = true;
+            }
+        }
+
+        return [
+            "status" => "success",
+            "hasConflicts" => count($formattedConflicts) > 0,
+            "hasWedding" => $hasWedding,
+            "hasOtherEvents" => $hasOtherEvents,
+            "conflicts" => $formattedConflicts
+        ];
+    } catch (Exception $e) {
+        error_log("checkEventConflicts error: " . $e->getMessage());
+        return [
+            "status" => "error",
+            "message" => "Failed to check event conflicts: " . $e->getMessage(),
+            "hasConflicts" => false,
+            "hasWedding" => false,
+            "hasOtherEvents" => false,
+            "conflicts" => []
+        ];
+    }
+}
+
+// Function to get calendar conflict data for heat map
+function getCalendarConflictData($startDate, $endDate) {
+    global $pdo;
+
+    try {
+        $sql = "
+            SELECT
+                e.event_date,
+                e.event_type_id,
+                et.event_name as event_type_name,
+                COUNT(*) as event_count
+            FROM tbl_events e
+            LEFT JOIN tbl_event_type et ON e.event_type_id = et.event_type_id
+            WHERE e.event_date BETWEEN ? AND ?
+            AND e.event_status NOT IN ('cancelled', 'completed')
+            GROUP BY e.event_date, e.event_type_id, et.event_name
+            ORDER BY e.event_date
+        ";
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$startDate, $endDate]);
+        $events = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Structure the data for frontend calendar
+        $calendarData = [];
+
+        foreach ($events as $event) {
+            $date = $event['event_date'];
+            $eventTypeId = (int)$event['event_type_id'];
+
+            if (!isset($calendarData[$date])) {
+                $calendarData[$date] = [
+                    'hasWedding' => false,
+                    'hasOtherEvents' => false,
+                    'eventCount' => 0,
+                    'events' => []
+                ];
+            }
+
+            $calendarData[$date]['eventCount'] += $event['event_count'];
+
+            if ($eventTypeId == 1) { // Wedding
+                $calendarData[$date]['hasWedding'] = true;
+            } else {
+                $calendarData[$date]['hasOtherEvents'] = true;
+            }
+
+            $calendarData[$date]['events'][] = [
+                'event_type_id' => $eventTypeId,
+                'event_type_name' => $event['event_type_name'],
+                'count' => $event['event_count']
+            ];
+        }
+
+        return [
+            "status" => "success",
+            "calendarData" => $calendarData,
+            "dateRange" => [
+                "startDate" => $startDate,
+                "endDate" => $endDate
+            ]
+        ];
+    } catch (Exception $e) {
+        error_log("getCalendarConflictData error: " . $e->getMessage());
+        return [
+            "status" => "error",
+            "message" => "Failed to get calendar conflict data: " . $e->getMessage(),
+            "calendarData" => []
+        ];
+    }
+}
+
 // Handle request
 handleCors();
 
@@ -828,6 +1084,10 @@ switch ($method) {
                 }
                 break;
 
+            case 'getAllPackages':
+                echo json_encode(getAllPackages());
+                break;
+
             default:
                 echo json_encode([
                     "status" => "error",
@@ -859,6 +1119,36 @@ switch ($method) {
                 $result = createBooking($data);
                 error_log("POST createBooking: Result: " . json_encode($result));
                 echo json_encode($result);
+                break;
+
+            case 'checkEventConflicts':
+                $eventDate = isset($data['event_date']) ? $data['event_date'] : '';
+                $startTime = isset($data['start_time']) ? $data['start_time'] : '';
+                $endTime = isset($data['end_time']) ? $data['end_time'] : '';
+                $excludeEventId = isset($data['exclude_event_id']) ? $data['exclude_event_id'] : null;
+
+                if ($eventDate && $startTime && $endTime) {
+                    echo json_encode(checkEventConflicts($eventDate, $startTime, $endTime, $excludeEventId));
+                } else {
+                    echo json_encode([
+                        "status" => "error",
+                        "message" => "Event date, start time, and end time are required"
+                    ]);
+                }
+                break;
+
+            case 'getCalendarConflictData':
+                $startDate = isset($data['start_date']) ? $data['start_date'] : '';
+                $endDate = isset($data['end_date']) ? $data['end_date'] : '';
+
+                if ($startDate && $endDate) {
+                    echo json_encode(getCalendarConflictData($startDate, $endDate));
+                } else {
+                    echo json_encode([
+                        "status" => "error",
+                        "message" => "Start date and end date are required"
+                    ]);
+                }
                 break;
 
             default:
