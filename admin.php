@@ -4278,22 +4278,33 @@ This is an automated message. Please do not reply.
 
     public function updateUserProfile($data) {
         try {
-            $sql = "UPDATE tbl_users SET
-                        user_firstName = ?,
-                        user_lastName = ?,
-                        user_email = ?,
-                        user_contact = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE user_id = ?";
+            // Build dynamic update query to handle optional profile picture
+            $updateFields = [
+                "user_firstName = ?",
+                "user_lastName = ?",
+                "user_email = ?",
+                "user_contact = ?"
+            ];
 
-            $stmt = $this->conn->prepare($sql);
-            $result = $stmt->execute([
+            $params = [
                 $data['firstName'],
                 $data['lastName'],
                 $data['email'],
-                $data['contact'],
-                $data['user_id']
-            ]);
+                $data['contact']
+            ];
+
+            // Add profile picture if provided
+            if (isset($data['user_pfp'])) {
+                $updateFields[] = "user_pfp = ?";
+                $params[] = $data['user_pfp'];
+            }
+
+            $params[] = $data['user_id'];
+
+            $sql = "UPDATE tbl_users SET " . implode(", ", $updateFields) . " WHERE user_id = ?";
+
+            $stmt = $this->conn->prepare($sql);
+            $result = $stmt->execute($params);
 
             if ($result) {
                 return json_encode([
@@ -4331,7 +4342,7 @@ This is an automated message. Please do not reply.
 
             // Update password
             $hashedPassword = password_hash($data['newPassword'], PASSWORD_DEFAULT);
-            $updateSql = "UPDATE tbl_users SET user_password = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?";
+            $updateSql = "UPDATE tbl_users SET user_password = ? WHERE user_id = ?";
             $updateStmt = $this->conn->prepare($updateSql);
             $result = $updateStmt->execute([$hashedPassword, $data['user_id']]);
 
@@ -4585,6 +4596,70 @@ This is an automated message. Please do not reply.
             return json_encode([
                 "status" => "error",
                 "message" => "Error uploading file: " . $e->getMessage()
+            ]);
+        }
+    }
+
+    public function uploadProfilePicture($file, $userId) {
+        try {
+            $uploadDir = "uploads/profile_pictures/";
+
+            // Create directory if it doesn't exist
+            if (!file_exists($uploadDir)) {
+                mkdir($uploadDir, 0777, true);
+            }
+
+            // Validate file type
+            $allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+            $fileType = $file['type'] ?? mime_content_type($file['tmp_name']);
+
+            if (!in_array($fileType, $allowedTypes)) {
+                return json_encode([
+                    "status" => "error",
+                    "message" => "Invalid file type. Only images are allowed."
+                ]);
+            }
+
+            // Generate unique filename
+            $fileExtension = pathinfo($file['name'], PATHINFO_EXTENSION);
+            if (empty($fileExtension)) {
+                $fileExtension = 'jpg'; // Default for blob uploads
+            }
+            $fileName = 'profile_' . $userId . '_' . time() . '.' . $fileExtension;
+            $filePath = $uploadDir . $fileName;
+
+            // Delete old profile picture if exists
+            $getUserSql = "SELECT user_pfp FROM tbl_users WHERE user_id = ?";
+            $getUserStmt = $this->conn->prepare($getUserSql);
+            $getUserStmt->execute([$userId]);
+            $userData = $getUserStmt->fetch(PDO::FETCH_ASSOC);
+
+            if ($userData && $userData['user_pfp'] && file_exists($userData['user_pfp'])) {
+                unlink($userData['user_pfp']);
+            }
+
+            // Move uploaded file
+            if (move_uploaded_file($file['tmp_name'], $filePath)) {
+                // Update user profile picture in database
+                $updateSql = "UPDATE tbl_users SET user_pfp = ? WHERE user_id = ?";
+                $updateStmt = $this->conn->prepare($updateSql);
+                $updateStmt->execute([$filePath, $userId]);
+
+                return json_encode([
+                    "status" => "success",
+                    "filePath" => $filePath,
+                    "message" => "Profile picture uploaded successfully"
+                ]);
+            } else {
+                return json_encode([
+                    "status" => "error",
+                    "message" => "Failed to upload file"
+                ]);
+            }
+        } catch (Exception $e) {
+            return json_encode([
+                "status" => "error",
+                "message" => "Error uploading profile picture: " . $e->getMessage()
             ]);
         }
     }
@@ -6648,6 +6723,14 @@ switch ($operation) {
         if (isset($_FILES['file'])) {
             $fileType = $_POST['fileType'] ?? 'misc';
             echo $admin->uploadFile($_FILES['file'], $fileType);
+        } else {
+            echo json_encode(["status" => "error", "message" => "No file uploaded"]);
+        }
+        break;
+    case "uploadProfilePicture":
+        if (isset($_FILES['file'])) {
+            $userId = $_POST['user_id'] ?? 0;
+            echo $admin->uploadProfilePicture($_FILES['file'], $userId);
         } else {
             echo json_encode(["status" => "error", "message" => "No file uploaded"]);
         }

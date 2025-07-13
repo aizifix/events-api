@@ -911,6 +911,155 @@ function getCalendarConflictData($startDate, $endDate) {
     }
 }
 
+// Function to get user profile
+function getUserProfile($userId) {
+    global $pdo;
+
+    try {
+        $sql = "SELECT user_id, user_firstName, user_lastName, user_email, user_contact, user_pfp, created_at
+                FROM tbl_users WHERE user_id = ?";
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$userId]);
+        $profile = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($profile) {
+            return ["status" => "success", "profile" => $profile];
+        } else {
+            return ["status" => "error", "message" => "User not found"];
+        }
+    } catch (PDOException $e) {
+        return ["status" => "error", "message" => "Database error: " . $e->getMessage()];
+    }
+}
+
+// Function to update user profile
+function updateUserProfile($data) {
+    global $pdo;
+
+    try {
+        // Build dynamic update query to handle optional profile picture
+        $updateFields = [
+            "user_firstName = ?",
+            "user_lastName = ?",
+            "user_email = ?",
+            "user_contact = ?"
+        ];
+
+        $params = [
+            $data['firstName'],
+            $data['lastName'],
+            $data['email'],
+            $data['contact']
+        ];
+
+        // Add profile picture if provided
+        if (isset($data['user_pfp'])) {
+            $updateFields[] = "user_pfp = ?";
+            $params[] = $data['user_pfp'];
+        }
+
+        $params[] = $data['user_id'];
+
+        $sql = "UPDATE tbl_users SET " . implode(", ", $updateFields) . " WHERE user_id = ?";
+
+        $stmt = $pdo->prepare($sql);
+        $result = $stmt->execute($params);
+
+        if ($result) {
+            return ["status" => "success", "message" => "Profile updated successfully"];
+        } else {
+            return ["status" => "error", "message" => "Failed to update profile"];
+        }
+    } catch (PDOException $e) {
+        return ["status" => "error", "message" => "Database error: " . $e->getMessage()];
+    }
+}
+
+// Function to change password
+function changePassword($data) {
+    global $pdo;
+
+    try {
+        // Verify current password
+        $sql = "SELECT user_pwd FROM tbl_users WHERE user_id = ?";
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$data['user_id']]);
+        $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$user || !password_verify($data['currentPassword'], $user['user_pwd'])) {
+            return ["status" => "error", "message" => "Current password is incorrect"];
+        }
+
+        // Update password
+        $hashedPassword = password_hash($data['newPassword'], PASSWORD_DEFAULT);
+        $updateSql = "UPDATE tbl_users SET user_pwd = ? WHERE user_id = ?";
+        $updateStmt = $pdo->prepare($updateSql);
+        $result = $updateStmt->execute([$hashedPassword, $data['user_id']]);
+
+        if ($result) {
+            return ["status" => "success", "message" => "Password changed successfully"];
+        } else {
+            return ["status" => "error", "message" => "Failed to change password"];
+        }
+    } catch (PDOException $e) {
+        return ["status" => "error", "message" => "Database error: " . $e->getMessage()];
+    }
+}
+
+// Function to upload profile picture
+function uploadProfilePicture($file, $userId) {
+    global $pdo;
+
+    try {
+        $uploadDir = "uploads/profile_pictures/";
+
+        // Create directory if it doesn't exist
+        if (!file_exists($uploadDir)) {
+            mkdir($uploadDir, 0777, true);
+        }
+
+        // Validate file type
+        $allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+        $fileType = $file['type'] ?? mime_content_type($file['tmp_name']);
+
+        if (!in_array($fileType, $allowedTypes)) {
+            return ["status" => "error", "message" => "Invalid file type. Only images are allowed."];
+        }
+
+        // Generate unique filename
+        $fileExtension = pathinfo($file['name'], PATHINFO_EXTENSION);
+        if (empty($fileExtension)) {
+            $fileExtension = 'jpg'; // Default for blob uploads
+        }
+        $fileName = 'profile_' . $userId . '_' . time() . '.' . $fileExtension;
+        $filePath = $uploadDir . $fileName;
+
+        // Delete old profile picture if exists
+        $getUserSql = "SELECT user_pfp FROM tbl_users WHERE user_id = ?";
+        $getUserStmt = $pdo->prepare($getUserSql);
+        $getUserStmt->execute([$userId]);
+        $userData = $getUserStmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($userData && $userData['user_pfp'] && file_exists($userData['user_pfp'])) {
+            unlink($userData['user_pfp']);
+        }
+
+        // Move uploaded file
+        if (move_uploaded_file($file['tmp_name'], $filePath)) {
+            // Update user profile picture in database
+            $updateSql = "UPDATE tbl_users SET user_pfp = ? WHERE user_id = ?";
+            $updateStmt = $pdo->prepare($updateSql);
+            $updateStmt->execute([$filePath, $userId]);
+
+            return ["status" => "success", "filePath" => $filePath, "message" => "Profile picture uploaded successfully"];
+        } else {
+            return ["status" => "error", "message" => "Failed to upload file"];
+        }
+    } catch (PDOException $e) {
+        return ["status" => "error", "message" => "Database error: " . $e->getMessage()];
+    }
+}
+
 // Handle request
 handleCors();
 
@@ -1088,6 +1237,19 @@ switch ($method) {
                 echo json_encode(getAllPackages());
                 break;
 
+            case 'getUserProfile':
+                $userId = isset($_GET['user_id']) ? intval($_GET['user_id']) : 0;
+
+                if ($userId > 0) {
+                    echo json_encode(getUserProfile($userId));
+                } else {
+                    echo json_encode([
+                        "status" => "error",
+                        "message" => "User ID is required"
+                    ]);
+                }
+                break;
+
             default:
                 echo json_encode([
                     "status" => "error",
@@ -1147,6 +1309,49 @@ switch ($method) {
                     echo json_encode([
                         "status" => "error",
                         "message" => "Start date and end date are required"
+                    ]);
+                }
+                break;
+
+            case 'updateUserProfile':
+                if (!isset($data['user_id']) || !isset($data['firstName']) || !isset($data['lastName']) ||
+                    !isset($data['email']) || !isset($data['contact'])) {
+                    echo json_encode([
+                        "status" => "error",
+                        "message" => "All profile fields are required"
+                    ]);
+                } else {
+                    echo json_encode(updateUserProfile($data));
+                }
+                break;
+
+            case 'changePassword':
+                if (!isset($data['user_id']) || !isset($data['currentPassword']) ||
+                    !isset($data['newPassword']) || !isset($data['confirmPassword'])) {
+                    echo json_encode([
+                        "status" => "error",
+                        "message" => "All password fields are required"
+                    ]);
+                } else {
+                    echo json_encode(changePassword($data));
+                }
+                break;
+
+            case 'uploadProfilePicture':
+                if (isset($_FILES['file'])) {
+                    $userId = isset($_POST['user_id']) ? intval($_POST['user_id']) : 0;
+                    if ($userId > 0) {
+                        echo json_encode(uploadProfilePicture($_FILES['file'], $userId));
+                    } else {
+                        echo json_encode([
+                            "status" => "error",
+                            "message" => "User ID is required"
+                        ]);
+                    }
+                } else {
+                    echo json_encode([
+                        "status" => "error",
+                        "message" => "No file uploaded"
                     ]);
                 }
                 break;

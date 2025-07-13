@@ -144,7 +144,7 @@ class Auth {
             // Required fields for registration
             $required = [
                 'firstName', 'lastName', 'birthdate', 'email', 'user_contact',
-                'username', 'password', 'vendorAddress', 'vendorContactNumber'
+                'password', 'vendorAddress', 'vendorContactNumber'
             ];
 
             foreach ($required as $field) {
@@ -153,11 +153,24 @@ class Auth {
                 }
             }
 
-            // Check if username or email already exists
-            $stmt = $this->conn->prepare("SELECT user_id FROM tbl_users WHERE user_username = ? OR user_email = ?");
-            $stmt->execute([$data['username'], $data['email']]);
+            // Check if email already exists
+            $stmt = $this->conn->prepare("SELECT user_id FROM tbl_users WHERE user_email = ?");
+            $stmt->execute([$data['email']]);
             if ($stmt->rowCount() > 0) {
-                return json_encode(["status" => "error", "message" => "Username or email already exists"]);
+                return json_encode(["status" => "error", "message" => "Email already exists"]);
+            }
+
+            // Generate a username from email (optional, for backward compatibility)
+            $username = explode('@', $data['email'])[0];
+            $baseUsername = $username;
+            $counter = 1;
+
+            // Keep checking until we find a unique username
+            while (true) {
+                $stmt = $this->conn->prepare("SELECT user_id FROM tbl_users WHERE user_username = ?");
+                $stmt->execute([$username]);
+                if ($stmt->rowCount() == 0) break;
+                $username = $baseUsername . $counter++;
             }
 
             // Insert into tbl_users
@@ -179,7 +192,7 @@ class Auth {
                 ':birthdate' => $data['birthdate'],
                 ':email' => $data['email'],
                 ':user_contact' => $data['user_contact'],
-                ':username' => $data['username'],
+                ':username' => $username, // Auto-generated username
                 ':password' => password_hash($data['password'], PASSWORD_DEFAULT),
                 ':role' => in_array($data['role'], ['client', 'organizer']) ? $data['role'] : 'client'
             ]);
@@ -214,15 +227,15 @@ class Auth {
         }
     }
 
-    public function login($username, $password) {
-        if (empty($username) || empty($password)) {
-            return json_encode(["status" => "error", "message" => "Username and password are required."]);
+    public function login($email, $password) {
+        if (empty($email) || empty($password)) {
+            return json_encode(["status" => "error", "message" => "Email and password are required."]);
         }
 
-        // Allow login by username or email
-        $sql = "SELECT * FROM tbl_users WHERE user_username = :username OR user_email = :email";
+        // Find user by email
+        $sql = "SELECT * FROM tbl_users WHERE user_email = :email";
         $stmt = $this->conn->prepare($sql);
-        $stmt->execute([':username' => $username, ':email' => $username]);
+        $stmt->execute([':email' => $email]);
 
         if ($stmt->rowCount() === 0) {
             return json_encode(["status" => "error", "message" => "User not found."]);
@@ -502,7 +515,7 @@ error_log("Determined operation: " . $operation);
 
 switch ($operation) {
     case "login":
-        echo $auth->login($_POST['username'] ?? $jsonData['username'], $_POST['password'] ?? $jsonData['password']);
+        echo $auth->login($_POST['email'] ?? $jsonData['email'], $_POST['password'] ?? $jsonData['password']);
         break;
     case "register":
         echo $auth->register($_POST);
@@ -517,25 +530,25 @@ switch ($operation) {
         $confirmPassword = $_POST['confirm_password'] ?? $jsonData['confirm_password'];
         echo $auth->changePassword($userId, $currentPassword, $newPassword, $confirmPassword);
         break;
-    case "check_username":
+    case "check_email":
         $jsonData = json_decode(file_get_contents("php://input"), true);
-        $username = $jsonData['username'] ?? $_POST['username'] ?? '';
+        $email = $jsonData['email'] ?? $_POST['email'] ?? '';
 
-        error_log("Checking username: " . $username);
+        error_log("Checking email: " . $email);
 
-        if (empty($username)) {
-            echo json_encode(["status" => "error", "message" => "Username required"]);
+        if (empty($email)) {
+            echo json_encode(["status" => "error", "message" => "Email required"]);
             exit;
         }
 
-        $stmt = $pdo->prepare("SELECT user_id FROM tbl_users WHERE user_username = ?");
-        $stmt->execute([$username]);
+        $stmt = $pdo->prepare("SELECT user_id FROM tbl_users WHERE user_email = ?");
+        $stmt->execute([$email]);
         $userExists = $stmt->fetch(PDO::FETCH_ASSOC);
 
         if ($userExists) {
-            echo json_encode(["status" => "error", "exists" => true, "message" => "Username already taken"]);
+            echo json_encode(["status" => "error", "exists" => true, "message" => "Email already taken"]);
         } else {
-            echo json_encode(["status" => "success", "exists" => false, "message" => "Username available"]);
+            echo json_encode(["status" => "success", "exists" => false, "message" => "Email available"]);
         }
         exit;
 
