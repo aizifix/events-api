@@ -3394,6 +3394,63 @@ This is an automated message. Please do not reply.
             return json_encode(["status" => "error", "message" => "Database error: " . $e->getMessage()]);
         }
     }
+    public function searchBookings($search) {
+        try {
+            $sql = "SELECT
+                        b.booking_id,
+                        b.booking_reference,
+                        b.user_id,
+                        CONCAT(u.user_firstName, ' ', u.user_lastName) as client_name,
+                        u.user_email as client_email,
+                        u.user_contact as client_phone,
+                        b.event_type_id,
+                        et.event_name as event_type_name,
+                        b.event_name,
+                        b.event_date,
+                        b.event_time,
+                        b.start_time,
+                        b.end_time,
+                        b.guest_count,
+                        b.venue_id,
+                        v.venue_title as venue_name,
+                        b.package_id,
+                        p.package_title as package_name,
+                        b.notes,
+                        b.booking_status,
+                        b.created_at,
+                        b.updated_at,
+                        CASE WHEN e.event_id IS NOT NULL THEN 1 ELSE 0 END as is_converted,
+                        e.event_id as converted_event_id
+                    FROM tbl_bookings b
+                    JOIN tbl_users u ON b.user_id = u.user_id
+                    JOIN tbl_event_type et ON b.event_type_id = et.event_type_id
+                    LEFT JOIN tbl_venue v ON b.venue_id = v.venue_id
+                    LEFT JOIN tbl_packages p ON b.package_id = p.package_id
+                    LEFT JOIN tbl_events e ON b.booking_reference = e.original_booking_reference
+                    WHERE b.booking_status = 'confirmed' AND (
+                        b.booking_reference LIKE :search1 OR
+                        CONCAT(u.user_firstName, ' ', u.user_lastName) LIKE :search2 OR
+                        b.event_name LIKE :search3
+                    )
+                    ORDER BY b.created_at DESC";
+            $stmt = $this->conn->prepare($sql);
+            $searchTerm = "%$search%";
+            $stmt->execute([
+                ':search1' => $searchTerm,
+                ':search2' => $searchTerm,
+                ':search3' => $searchTerm
+            ]);
+            $bookings = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            return json_encode([
+                "status" => "success",
+                "bookings" => $bookings,
+                "count" => count($bookings)
+            ]);
+        } catch (Exception $e) {
+            error_log("searchBookings error: " . $e->getMessage());
+            return json_encode(["status" => "error", "message" => "Database error: " . $e->getMessage()]);
+        }
+    }
     public function getEventByBookingReference($bookingReference) { return json_encode(["status" => "error", "message" => "Method not implemented"]); }
     public function testBookingsTable() { return json_encode(["status" => "error", "message" => "Method not implemented"]); }
     public function createVenue() {
@@ -7504,6 +7561,10 @@ switch ($operation) {
         break;
     case "getConfirmedBookings":
         echo $admin->getConfirmedBookings();
+        break;
+    case "searchBookings":
+        $search = $_GET['search'] ?? ($data['search'] ?? '');
+        echo $admin->searchBookings($search);
         break;
     case "getEventByBookingReference":
         $bookingReference = $_GET['booking_reference'] ?? ($data['booking_reference'] ?? '');
