@@ -229,11 +229,11 @@ class Admin {
                     $sql = "INSERT INTO tbl_event_components (
                                 event_id, component_name, component_description,
                                 component_price, is_custom, is_included,
-                                original_package_component_id, display_order
+                                original_package_component_id, supplier_id, offer_id, display_order
                             ) VALUES (
                                 :event_id, :name, :description,
                                 :price, :is_custom, :is_included,
-                                :original_package_component_id, :display_order
+                                :original_package_component_id, :supplier_id, :offer_id, :display_order
                             )";
 
                     $stmt = $this->conn->prepare($sql);
@@ -245,6 +245,8 @@ class Admin {
                         ':is_custom' => $component['is_custom'] ?? false,
                         ':is_included' => $component['is_included'] ?? true,
                         ':original_package_component_id' => $component['original_package_component_id'] ?? null,
+                        ':supplier_id' => $component['supplier_id'] ?? null,
+                        ':offer_id' => $component['offer_id'] ?? null,
                         ':display_order' => $index
                     ]);
                 }
@@ -3880,6 +3882,37 @@ This is an automated message. Please do not reply.
             ]);
         }
     }
+
+    // Get all available venues for "start from scratch" events
+    public function getAllAvailableVenues() {
+        try {
+            $sql = "SELECT v.*,
+                           COALESCE(v.venue_price, 0) as venue_price,
+                           COALESCE(v.extra_pax_rate, 0) as extra_pax_rate,
+                           v.venue_capacity,
+                           v.venue_type,
+                           v.venue_profile_picture,
+                           v.venue_cover_photo
+                    FROM tbl_venue v
+                    WHERE v.is_active = 1 AND v.venue_status = 'available'
+                    ORDER BY v.venue_title ASC";
+
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute();
+            $venues = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            return json_encode([
+                "status" => "success",
+                "venues" => $venues
+            ]);
+        } catch (Exception $e) {
+            return json_encode([
+                "status" => "error",
+                "message" => "Database error: " . $e->getMessage()
+            ]);
+        }
+    }
+
     public function calculateVenuePricing($venueId, $guestCount) {
         try {
             // Get venue details
@@ -6399,11 +6432,11 @@ This is an automated message. Please do not reply.
             $sql = "INSERT INTO tbl_event_components (
                         event_id, component_name, component_description,
                         component_price, is_custom, is_included,
-                        original_package_component_id, display_order
+                        original_package_component_id, supplier_id, offer_id, display_order
                     ) VALUES (
                         :event_id, :name, :description,
                         :price, :is_custom, :is_included,
-                        :original_package_component_id, :display_order
+                        :original_package_component_id, :supplier_id, :offer_id, :display_order
                     )";
 
             $stmt = $this->conn->prepare($sql);
@@ -6415,6 +6448,8 @@ This is an automated message. Please do not reply.
                 ':is_custom' => $data['is_custom'] ?? true,
                 ':is_included' => $data['is_included'] ?? true,
                 ':original_package_component_id' => $data['original_package_component_id'] ?? null,
+                ':supplier_id' => $data['supplier_id'] ?? null,
+                ':offer_id' => $data['offer_id'] ?? null,
                 ':display_order' => $data['display_order'] ?? 0
             ]);
 
@@ -7599,6 +7634,9 @@ switch ($operation) {
         break;
     case "getVenuesForPackage":
         echo $admin->getVenuesForPackage();
+        break;
+    case "getAllAvailableVenues":
+        echo $admin->getAllAvailableVenues();
         break;
     case "calculateVenuePricing":
         $venueId = $_GET['venue_id'] ?? ($data['venue_id'] ?? 0);
