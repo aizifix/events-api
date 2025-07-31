@@ -295,6 +295,18 @@ class Admin {
             if (!empty($data['down_payment']) && $data['down_payment'] > 0) {
                 error_log("createEvent: Creating payment record with amount: " . $data['down_payment']);
 
+                // Check for duplicate payment reference if provided
+                if (!empty($data['reference_number'])) {
+                    $referenceCheckSql = "SELECT payment_id FROM tbl_payments WHERE payment_reference = ? LIMIT 1";
+                    $referenceCheckStmt = $this->conn->prepare($referenceCheckSql);
+                    $referenceCheckStmt->execute([$data['reference_number']]);
+                    if ($referenceCheckStmt->fetch(PDO::FETCH_ASSOC)) {
+                        $this->conn->rollback();
+                        error_log("createEvent: Duplicate payment reference detected: " . $data['reference_number']);
+                        return json_encode(["status" => "error", "message" => "Payment reference already exists. Please use a unique reference number."]);
+                    }
+                }
+
                 $paymentSql = "INSERT INTO tbl_payments (
                     event_id, client_id, payment_method, payment_amount,
                     payment_notes, payment_status, payment_date, payment_reference
@@ -3011,10 +3023,10 @@ This is an automated message. Please do not reply.
                 $stmt->execute([$eventId]);
                 $event['timeline'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-                // Get payment history
+                // Get payment history (exclude cancelled payments)
                 $stmt = $this->pdo->prepare("
                     SELECT * FROM tbl_payments
-                    WHERE event_id = ?
+                    WHERE event_id = ? AND payment_status != 'cancelled'
                     ORDER BY payment_date DESC, created_at DESC
                 ");
                 $stmt->execute([$eventId]);
@@ -3221,7 +3233,7 @@ This is an automated message. Please do not reply.
             $stmt->execute([$eventId]);
             $event['payment_schedule'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-            // Get payments
+            // Get payments (exclude cancelled payments)
             $stmt = $this->pdo->prepare("
                 SELECT
                     p.*,
@@ -3229,7 +3241,7 @@ This is an automated message. Please do not reply.
                     eps.due_date as schedule_due_date
                 FROM tbl_payments p
                 LEFT JOIN tbl_event_payment_schedules eps ON p.schedule_id = eps.schedule_id
-                WHERE p.event_id = ?
+                WHERE p.event_id = ? AND p.payment_status != 'cancelled'
                 ORDER BY p.payment_date DESC
             ");
             $stmt->execute([$eventId]);
@@ -4327,6 +4339,20 @@ This is an automated message. Please do not reply.
     public function createPayment($data) {
         try {
             $this->pdo->beginTransaction();
+
+            // Check for duplicate payment reference if provided
+            if (!empty($data['payment_reference'])) {
+                $referenceCheckSql = "SELECT payment_id FROM tbl_payments WHERE payment_reference = ? LIMIT 1";
+                $referenceCheckStmt = $this->pdo->prepare($referenceCheckSql);
+                $referenceCheckStmt->execute([$data['payment_reference']]);
+                if ($referenceCheckStmt->fetch(PDO::FETCH_ASSOC)) {
+                    $this->pdo->rollback();
+                    return json_encode([
+                        "status" => "error",
+                        "message" => "Payment reference already exists. Please use a unique reference number."
+                    ]);
+                }
+            }
 
             // Handle payment attachments if provided
             $attachments = null;
@@ -6158,10 +6184,10 @@ This is an automated message. Please do not reply.
                         WHEN e.total_budget > 0 THEN ROUND((COALESCE(SUM(CASE WHEN p.payment_status = 'completed' THEN p.payment_amount ELSE 0 END), 0) / e.total_budget) * 100, 2)
                         ELSE 0
                     END as payment_percentage,
-                    COUNT(p.payment_id) as payment_count
+                    COUNT(CASE WHEN p.payment_status != 'cancelled' THEN p.payment_id END) as payment_count
                 FROM tbl_events e
                 LEFT JOIN tbl_users u ON e.user_id = u.user_id
-                LEFT JOIN tbl_payments p ON e.event_id = p.event_id
+                LEFT JOIN tbl_payments p ON e.event_id = p.event_id AND p.payment_status != 'cancelled'
                 WHERE e.admin_id = ?
             ";
 
@@ -6240,7 +6266,7 @@ This is an automated message. Please do not reply.
                 ]);
             }
 
-                        // Get payment history for this event
+                        // Get payment history for this event (exclude cancelled payments)
             $paymentsQuery = "
                 SELECT
                     p.payment_id,
@@ -6258,7 +6284,7 @@ This is an automated message. Please do not reply.
                     DATE_FORMAT(p.updated_at, '%Y-%m-%d %H:%i:%s') as formatted_updated_at
                 FROM tbl_payments p
                 LEFT JOIN tbl_users u ON p.client_id = u.user_id
-                WHERE p.event_id = ?
+                WHERE p.event_id = ? AND p.payment_status != 'cancelled'
                 ORDER BY p.created_at DESC, p.payment_date DESC
             ";
 
@@ -7573,14 +7599,34 @@ if (!$pdo) {
 $rawInput = file_get_contents("php://input");
 $data = json_decode($rawInput, true);
 
-// Debug logging (commented out for production)
-// error_log("Admin.php - Raw input: " . $rawInput);
-// error_log("Admin.php - Decoded data: " . json_encode($data));
-// error_log("Admin.php - POST data: " . json_encode($_POST));
-// error_log("Admin.php - GET data: " . json_encode($_GET));
+// Debug logging for troubleshooting
+error_log("Admin.php - Raw input: " . $rawInput);
+error_log("Admin.php - JSON decode error: " . json_last_error_msg());
+error_log("Admin.php - Decoded data: " . json_encode($data));
+error_log("Admin.php - POST data: " . json_encode($_POST));
+error_log("Admin.php - GET data: " . json_encode($_GET));
+
+// Handle JSON parsing errors
+if ($data === null && json_last_error() !== JSON_ERROR_NONE) {
+    error_log("Admin.php - JSON parsing failed: " . json_last_error_msg());
+    echo json_encode([
+        "status" => "error",
+        "message" => "Invalid JSON data: " . json_last_error_msg(),
+        "raw_input" => $rawInput
+    ]);
+    exit;
+}
+
+// Ensure $data is an array
+if (!is_array($data)) {
+    $data = [];
+}
 
 // Check if operation is provided via GET or POST
 $operation = $_POST['operation'] ?? ($_GET['operation'] ?? ($data['operation'] ?? ''));
+
+error_log("Admin.php - Operation: " . $operation);
+error_log("Admin.php - Final data: " . json_encode($data));
 
 // error_log("Admin.php - Operation: " . $operation);
 // error_log("Admin.php - All data: " . json_encode($data));
@@ -8176,7 +8222,13 @@ switch ($operation) {
         break;
 
     default:
-        echo json_encode(["status" => "error", "message" => "Invalid action."]);
+        error_log("Admin.php - Unknown operation: " . $operation);
+        error_log("Admin.php - Available data: " . json_encode($data));
+        echo json_encode([
+            "status" => "error",
+            "message" => "Invalid or missing operation: '$operation'",
+            "received_data" => $data
+        ]);
         break;
 }
 
