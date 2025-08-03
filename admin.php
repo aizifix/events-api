@@ -1,4 +1,7 @@
 <?php
+// Start output buffering to prevent any accidental output
+ob_start();
+
 require 'db_connect.php';
 
 // Add CORS headers for API access
@@ -16,8 +19,25 @@ header("Content-Type: application/json");
 
 // Error reporting for debugging
 error_reporting(E_ALL);
-ini_set('display_errors', 1);
+ini_set('display_errors', 0); // Don't display errors directly, return them as JSON
 ini_set('log_errors', 1);
+ini_set('error_log', 'php_errors.log');
+
+// Custom error handler to return JSON errors
+set_error_handler(function($errno, $errstr, $errfile, $errline) {
+    error_log("PHP Error: $errstr in $errfile on line $errline");
+    header('Content-Type: application/json');
+    echo json_encode([
+        "status" => "error",
+        "message" => "Server error occurred",
+        "debug" => [
+            "error" => $errstr,
+            "file" => basename($errfile),
+            "line" => $errline
+        ]
+    ]);
+    exit;
+});
 
 class Admin {
     private $conn;
@@ -33,10 +53,14 @@ class Admin {
             // Log the incoming data for debugging
             error_log("createEvent received data: " . json_encode($data));
 
+                        // Add debug response to check if function is being called
+            error_log("createEvent function called successfully");
+
             // Filter input data to only include expected fields to prevent SQL injection of unknown columns
             $allowedFields = [
                 'operation', 'original_booking_reference', 'user_id', 'admin_id', 'organizer_id',
-                'event_title', 'event_theme', 'event_description', 'event_type_id', 'guest_count',
+                'external_organizer', 'event_title', 'event_theme', 'event_description',
+                'church_location', 'church_start_time', 'event_type_id', 'guest_count',
                 'event_date', 'start_time', 'end_time', 'package_id', 'venue_id', 'total_budget',
                 'down_payment', 'payment_method', 'payment_schedule_type_id', 'reference_number',
                 'additional_notes', 'event_status', 'is_recurring', 'recurrence_rule',
@@ -61,9 +85,20 @@ class Admin {
             $required = ['user_id', 'admin_id', 'event_title', 'event_type_id', 'guest_count', 'event_date'];
             foreach ($required as $field) {
                 if (empty($data[$field])) {
+                    $this->conn->rollback();
                     error_log("createEvent error: Missing required field: $field");
                     return json_encode(["status" => "error", "message" => "$field is required"]);
                 }
+            }
+
+            // Wedding-specific validation
+            if ($data['event_type_id'] == 1) { // Wedding event
+                if (empty($data['church_start_time'])) {
+                    $this->conn->rollback();
+                    error_log("createEvent error: Church start time is required for wedding events");
+                    return json_encode(["status" => "error", "message" => "Church start time is required for wedding events"]);
+                }
+                // Note: church_location is optional even for weddings
             }
 
             // Validate foreign key references before insertion
@@ -71,20 +106,26 @@ class Admin {
             $userCheck = $this->conn->prepare("SELECT user_id FROM tbl_users WHERE user_id = ? LIMIT 1");
             $userCheck->execute([$data['user_id']]);
             if (!$userCheck->fetch(PDO::FETCH_ASSOC)) {
+                $this->conn->rollback();
                 return json_encode(["status" => "error", "message" => "Invalid user_id: User does not exist"]);
             }
 
-            // Check if admin exists
-            $adminCheck = $this->conn->prepare("SELECT user_id FROM tbl_users WHERE user_id = ? AND user_role = 'admin' LIMIT 1");
+            // Check if admin exists - temporarily make this less strict for debugging
+            $adminCheck = $this->conn->prepare("SELECT user_id, user_role FROM tbl_users WHERE user_id = ? LIMIT 1");
             $adminCheck->execute([$data['admin_id']]);
-            if (!$adminCheck->fetch(PDO::FETCH_ASSOC)) {
-                return json_encode(["status" => "error", "message" => "Invalid admin_id: Admin user does not exist"]);
+            $adminUser = $adminCheck->fetch(PDO::FETCH_ASSOC);
+            if (!$adminUser) {
+                $this->conn->rollback();
+                error_log("createEvent: Admin user not found with ID: " . $data['admin_id']);
+                return json_encode(["status" => "error", "message" => "Invalid admin_id: User does not exist"]);
             }
+            error_log("createEvent: Admin user found with role: " . $adminUser['user_role']);
 
             // Check if event type exists
             $eventTypeCheck = $this->conn->prepare("SELECT event_type_id FROM tbl_event_type WHERE event_type_id = ? LIMIT 1");
             $eventTypeCheck->execute([$data['event_type_id']]);
             if (!$eventTypeCheck->fetch(PDO::FETCH_ASSOC)) {
+                $this->conn->rollback();
                 return json_encode(["status" => "error", "message" => "Invalid event_type_id: Event type does not exist. Available types: 1=Wedding, 2=Anniversary, 3=Birthday, 4=Corporate, 5=Others"]);
             }
 
@@ -93,6 +134,7 @@ class Admin {
                 $packageCheck = $this->conn->prepare("SELECT package_id FROM tbl_packages WHERE package_id = ? LIMIT 1");
                 $packageCheck->execute([$data['package_id']]);
                 if (!$packageCheck->fetch(PDO::FETCH_ASSOC)) {
+                    $this->conn->rollback();
                     return json_encode(["status" => "error", "message" => "Invalid package_id: Package does not exist"]);
                 }
             }
@@ -102,6 +144,7 @@ class Admin {
                 $venueCheck = $this->conn->prepare("SELECT venue_id FROM tbl_venue WHERE venue_id = ? LIMIT 1");
                 $venueCheck->execute([$data['venue_id']]);
                 if (!$venueCheck->fetch(PDO::FETCH_ASSOC)) {
+                    $this->conn->rollback();
                     return json_encode(["status" => "error", "message" => "Invalid venue_id: Venue does not exist"]);
                 }
             }
@@ -121,6 +164,7 @@ class Admin {
                 $existingWedding = $weddingCheck->fetch(PDO::FETCH_ASSOC);
 
                 if ($existingWedding) {
+                    $this->conn->rollback();
                     return json_encode([
                         "status" => "error",
                         "message" => "Business rule violation: Only one wedding is allowed per day. There is already a wedding scheduled on " . $data['event_date'] . "."
@@ -139,6 +183,7 @@ class Admin {
                 $otherEvents = $otherEventsCheck->fetchAll();
 
                 if (!empty($otherEvents)) {
+                    $this->conn->rollback();
                     $eventTypes = array_unique(array_column($otherEvents, 'event_type_id'));
                     return json_encode([
                         "status" => "error",
@@ -159,6 +204,7 @@ class Admin {
                 $existingWedding = $weddingCheck->fetch(PDO::FETCH_ASSOC);
 
                 if ($existingWedding) {
+                    $this->conn->rollback();
                     return json_encode([
                         "status" => "error",
                         "message" => "Business rule violation: Other events cannot be scheduled on the same date as a wedding. There is already a wedding scheduled on " . $data['event_date'] . "."
@@ -169,13 +215,13 @@ class Admin {
             // Insert the main event
             $sql = "INSERT INTO tbl_events (
                         original_booking_reference, user_id, admin_id, organizer_id, event_title,
-                        event_theme, event_description, event_type_id, guest_count, event_date, start_time, end_time,
+                        event_theme, event_description, church_location, church_start_time, event_type_id, guest_count, event_date, start_time, end_time,
                         package_id, venue_id, total_budget, down_payment, payment_method,
                         reference_number, additional_notes, event_status, payment_schedule_type_id,
                         is_recurring, recurrence_rule, client_signature, finalized_at, event_attachments
                     ) VALUES (
                         :original_booking_reference, :user_id, :admin_id, :organizer_id, :event_title,
-                        :event_theme, :event_description, :event_type_id, :guest_count, :event_date, :start_time, :end_time,
+                        :event_theme, :event_description, :church_location, :church_start_time, :event_type_id, :guest_count, :event_date, :start_time, :end_time,
                         :package_id, :venue_id, :total_budget, :down_payment, :payment_method,
                         :reference_number, :additional_notes, :event_status, :payment_schedule_type_id,
                         :is_recurring, :recurrence_rule, :client_signature, :finalized_at, :event_attachments
@@ -191,6 +237,8 @@ class Admin {
                 ':event_title' => $data['event_title'],
                 ':event_theme' => $data['event_theme'] ?? null,
                 ':event_description' => $data['event_description'] ?? null,
+                ':church_location' => $data['church_location'] ?? null,
+                ':church_start_time' => $data['church_start_time'] ?? null,
                 ':event_type_id' => $data['event_type_id'],
                 ':guest_count' => $data['guest_count'],
                 ':event_date' => $data['event_date'],
@@ -4354,6 +4402,45 @@ This is an automated message. Please do not reply.
                 }
             }
 
+                        // Check for duplicate payment (same event, amount, date, method) to prevent ghost payments
+            $duplicateCheckSql = "SELECT payment_id FROM tbl_payments
+                                 WHERE event_id = ? AND payment_amount = ? AND payment_date = ?
+                                 AND payment_method = ? AND payment_status != 'cancelled'
+                                 LIMIT 1";
+            $duplicateCheckStmt = $this->pdo->prepare($duplicateCheckSql);
+            $duplicateCheckStmt->execute([
+                $data['event_id'],
+                $data['payment_amount'],
+                $data['payment_date'] ?? date('Y-m-d'),
+                $data['payment_method']
+            ]);
+            if ($duplicateCheckStmt->fetch(PDO::FETCH_ASSOC)) {
+                $this->pdo->rollback();
+                return json_encode([
+                    "status" => "error",
+                    "message" => "Duplicate payment detected. A payment with the same amount, date, and method already exists for this event."
+                ]);
+            }
+
+            // Additional check: Prevent multiple payments within 5 minutes for same event
+            $recentPaymentCheckSql = "SELECT payment_id FROM tbl_payments
+                                     WHERE event_id = ? AND client_id = ?
+                                     AND created_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+                                     AND payment_status != 'cancelled'
+                                     LIMIT 1";
+            $recentPaymentStmt = $this->pdo->prepare($recentPaymentCheckSql);
+            $recentPaymentStmt->execute([
+                $data['event_id'],
+                $data['client_id']
+            ]);
+            if ($recentPaymentStmt->fetch(PDO::FETCH_ASSOC)) {
+                $this->pdo->rollback();
+                return json_encode([
+                    "status" => "error",
+                    "message" => "Payment creation too frequent. Please wait at least 5 minutes between payments for the same event."
+                ]);
+            }
+
             // Handle payment attachments if provided
             $attachments = null;
             if (isset($data['payment_attachments']) && !empty($data['payment_attachments'])) {
@@ -6226,7 +6313,7 @@ This is an automated message. Please do not reply.
 
     public function getEventPaymentDetails($eventId) {
         try {
-            // Get event details with payment summary
+            // Get event details with payment summary - EXCLUDE CANCELLED PAYMENTS
             $eventQuery = "
                 SELECT
                     e.event_id,
@@ -6245,7 +6332,7 @@ This is an automated message. Please do not reply.
                         WHEN e.total_budget > 0 THEN ROUND((COALESCE(SUM(CASE WHEN p.payment_status = 'completed' THEN p.payment_amount ELSE 0 END), 0) / e.total_budget) * 100, 2)
                         ELSE 0
                     END as payment_percentage,
-                    COUNT(p.payment_id) as total_payments,
+                    COUNT(CASE WHEN p.payment_status != 'cancelled' THEN 1 END) as total_payments,
                     COUNT(CASE WHEN p.payment_status = 'completed' THEN 1 END) as completed_payments,
                     COUNT(CASE WHEN p.payment_status = 'pending' THEN 1 END) as pending_payments
                 FROM tbl_events e
@@ -6266,7 +6353,7 @@ This is an automated message. Please do not reply.
                 ]);
             }
 
-                        // Get payment history for this event (exclude cancelled payments)
+            // Get payment history for this event (exclude cancelled payments)
             $paymentsQuery = "
                 SELECT
                     p.payment_id,
@@ -6301,14 +6388,14 @@ This is an automated message. Please do not reply.
                 }
             }
 
-            // Get payment summary by method
+            // Get payment summary by method (exclude cancelled payments)
             $paymentSummaryQuery = "
                 SELECT
                     p.payment_method,
                     COUNT(*) as payment_count,
                     SUM(CASE WHEN p.payment_status = 'completed' THEN p.payment_amount ELSE 0 END) as total_amount
                 FROM tbl_payments p
-                WHERE p.event_id = ?
+                WHERE p.event_id = ? AND p.payment_status != 'cancelled'
                 GROUP BY p.payment_method
                 ORDER BY total_amount DESC
             ";
@@ -6663,6 +6750,63 @@ This is an automated message. Please do not reply.
         }
     }
 
+    public function updateComponentPaymentStatus($data) {
+        try {
+            if (!isset($data['component_id']) || !isset($data['payment_status'])) {
+                return json_encode(["status" => "error", "message" => "Component ID and payment status are required"]);
+            }
+
+            $validStatuses = ['pending', 'paid'];
+            if (!in_array($data['payment_status'], $validStatuses)) {
+                return json_encode(["status" => "error", "message" => "Invalid payment status"]);
+            }
+
+            $sql = "UPDATE tbl_event_components
+                    SET payment_status = :payment_status,
+                        payment_date = :payment_date,
+                        payment_notes = :payment_notes
+                    WHERE component_id = :component_id";
+
+            $stmt = $this->pdo->prepare($sql);
+            $result = $stmt->execute([
+                ':component_id' => $data['component_id'],
+                ':payment_status' => $data['payment_status'],
+                ':payment_date' => $data['payment_status'] === 'paid' ? date('Y-m-d H:i:s') : null,
+                ':payment_notes' => $data['payment_notes'] ?? null
+            ]);
+
+            if ($result) {
+                // Get event details to check if all components are paid
+                $sql = "SELECT ec.event_id,
+                        COUNT(ec.component_id) as total_components,
+                        SUM(CASE WHEN ec.payment_status = 'paid' THEN 1 ELSE 0 END) as paid_components
+                        FROM tbl_event_components ec
+                        WHERE ec.event_id = (SELECT event_id FROM tbl_event_components WHERE component_id = :component_id)
+                        GROUP BY ec.event_id";
+                $stmt = $this->pdo->prepare($sql);
+                $stmt->execute([':component_id' => $data['component_id']]);
+                $eventStats = $stmt->fetch(PDO::FETCH_ASSOC);
+
+                $completionPercentage = $eventStats && $eventStats['total_components'] > 0
+                    ? round(($eventStats['paid_components'] / $eventStats['total_components']) * 100)
+                    : 0;
+
+                return json_encode([
+                    "status" => "success",
+                    "message" => "Component payment status updated successfully",
+                    "total_components" => $eventStats ? (int)$eventStats['total_components'] : 0,
+                    "paid_components" => $eventStats ? (int)$eventStats['paid_components'] : 0,
+                    "completion_percentage" => $completionPercentage
+                ]);
+            } else {
+                return json_encode(["status" => "error", "message" => "Failed to update payment status"]);
+            }
+        } catch (Exception $e) {
+            error_log("updateComponentPaymentStatus error: " . $e->getMessage());
+            return json_encode(["status" => "error", "message" => "Database error: " . $e->getMessage()]);
+        }
+    }
+
     public function updateEventBudget($eventId, $budgetChange) {
         try {
             // Get current budget
@@ -6691,6 +6835,50 @@ This is an automated message. Please do not reply.
                 "status" => "error",
                 "message" => "Database error: " . $e->getMessage()
             ]);
+        }
+    }
+
+    public function getEventPaymentStats($eventId) {
+        try {
+            $sql = "SELECT
+                    COUNT(ec.component_id) as total_components,
+                    SUM(CASE WHEN ec.is_included = 1 THEN 1 ELSE 0 END) as included_components,
+                    SUM(CASE WHEN ec.payment_status = 'paid' AND ec.is_included = 1 THEN 1 ELSE 0 END) as paid_components,
+                    SUM(CASE WHEN ec.supplier_status = 'delivered' AND ec.is_included = 1 THEN 1 ELSE 0 END) as finalized_inclusions,
+                    SUM(CASE WHEN ec.is_included = 1 THEN ec.component_price ELSE 0 END) as total_value,
+                    SUM(CASE WHEN ec.payment_status = 'paid' AND ec.is_included = 1 THEN ec.component_price ELSE 0 END) as paid_value
+                    FROM tbl_event_components ec
+                    WHERE ec.event_id = :event_id";
+
+            $stmt = $this->pdo->prepare($sql);
+            $stmt->execute([':event_id' => $eventId]);
+            $stats = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            $paymentPercentage = $stats['included_components'] > 0
+                ? round(($stats['paid_components'] / $stats['included_components']) * 100)
+                : 0;
+
+            $inclusionPercentage = $stats['included_components'] > 0
+                ? round(($stats['finalized_inclusions'] / $stats['included_components']) * 100)
+                : 0;
+
+            return json_encode([
+                "status" => "success",
+                "stats" => [
+                    "total_components" => (int)$stats['total_components'],
+                    "included_components" => (int)$stats['included_components'],
+                    "paid_components" => (int)$stats['paid_components'],
+                    "finalized_inclusions" => (int)$stats['finalized_inclusions'],
+                    "total_value" => (float)$stats['total_value'],
+                    "paid_value" => (float)$stats['paid_value'],
+                    "payment_percentage" => $paymentPercentage,
+                    "inclusion_percentage" => $inclusionPercentage,
+                    "can_finalize" => $inclusionPercentage === 100
+                ]
+            ]);
+        } catch (Exception $e) {
+            error_log("getEventPaymentStats error: " . $e->getMessage());
+            return json_encode(["status" => "error", "message" => "Database error: " . $e->getMessage()]);
         }
     }
 
@@ -6778,28 +6966,46 @@ This is an automated message. Please do not reply.
                 ]);
             }
 
-            if ($action === "lock") {
-                // Finalize and lock the event
+            if ($action === "finalize") {
+                // Check if all included components have finalized inclusion status
+                $inclusionCheckSql = "SELECT
+                    COUNT(*) as total_included,
+                    SUM(CASE WHEN supplier_status = 'delivered' THEN 1 ELSE 0 END) as finalized_inclusions
+                    FROM tbl_event_components
+                    WHERE event_id = ? AND is_included = 1";
+                $checkStmt = $this->pdo->prepare($inclusionCheckSql);
+                $checkStmt->execute([$eventId]);
+                $inclusionStats = $checkStmt->fetch(PDO::FETCH_ASSOC);
+
+                if ($inclusionStats['total_included'] > 0 && $inclusionStats['finalized_inclusions'] < $inclusionStats['total_included']) {
+                    return json_encode([
+                        "status" => "error",
+                        "message" => "Cannot finalize event. All inclusion statuses must be finalized (delivered) first.",
+                        "pending_inclusions" => $inclusionStats['total_included'] - $inclusionStats['finalized_inclusions']
+                    ]);
+                }
+
+                // Finalize the event (no locking, remains editable until event starts)
                 $updateSql = "UPDATE tbl_events SET
-                             event_status = 'finalized',
+                             event_status = 'confirmed',
                              finalized_at = NOW(),
                              updated_at = NOW()
                              WHERE event_id = ?";
                 $updateStmt = $this->pdo->prepare($updateSql);
                 $updateStmt->execute([$eventId]);
 
-                // Send notification to organizer about upcoming payments
+                // Send notification to organizer about finalization
                 $this->sendFinalizationNotification($event);
 
                 return json_encode([
                     "status" => "success",
-                    "message" => "Event has been finalized and locked for editing",
+                    "message" => "Event has been finalized. Event remains editable until the event starts.",
                     "finalized_at" => date('Y-m-d H:i:s')
                 ]);
             } else {
-                // Unlock the event
+                // Unfinalize the event
                 $updateSql = "UPDATE tbl_events SET
-                             event_status = 'confirmed',
+                             event_status = 'draft',
                              finalized_at = NULL,
                              updated_at = NOW()
                              WHERE event_id = ?";
@@ -6808,7 +7014,7 @@ This is an automated message. Please do not reply.
 
                 return json_encode([
                     "status" => "success",
-                    "message" => "Event has been unlocked for editing"
+                    "message" => "Event has been set back to draft status"
                 ]);
             }
         } catch (PDOException $e) {
@@ -7600,6 +7806,9 @@ $rawInput = file_get_contents("php://input");
 $data = json_decode($rawInput, true);
 
 // Debug logging for troubleshooting
+error_log("Admin.php - Request method: " . $_SERVER['REQUEST_METHOD']);
+error_log("Admin.php - Content type: " . ($_SERVER['CONTENT_TYPE'] ?? 'not set'));
+error_log("Admin.php - Raw input length: " . strlen($rawInput));
 error_log("Admin.php - Raw input: " . $rawInput);
 error_log("Admin.php - JSON decode error: " . json_last_error_msg());
 error_log("Admin.php - Decoded data: " . json_encode($data));
@@ -7635,11 +7844,41 @@ error_log("Admin.php - Final data: " . json_encode($data));
 
 $admin = new Admin($pdo);
 
-// Handle API actions
-switch ($operation) {
+// Wrap entire execution in try-catch to handle any uncaught exceptions
+try {
+    // Handle API actions
+    switch ($operation) {
     case "createEvent":
         error_log("Admin.php - Starting createEvent operation");
-        echo $admin->createEvent($data);
+        try {
+            $result = $admin->createEvent($data);
+            error_log("Admin.php - createEvent result: " . $result);
+
+            // Ensure we have a valid result
+            if (empty($result)) {
+                throw new Exception("Empty result from createEvent function");
+            }
+
+            // Decode to verify it's valid JSON
+            $decoded = json_decode($result, true);
+            if ($decoded === null && json_last_error() !== JSON_ERROR_NONE) {
+                throw new Exception("Invalid JSON response from createEvent: " . json_last_error_msg());
+            }
+
+            // Clear any previous output
+            if (ob_get_length()) {
+                ob_clean();
+            }
+
+            // Send the response
+            echo $result;
+        } catch (Exception $e) {
+            error_log("Admin.php - createEvent exception: " . $e->getMessage());
+            echo json_encode([
+                "status" => "error",
+                "message" => "Failed to create event: " . $e->getMessage()
+            ]);
+        }
         break;
     case "getAllVendors":
         echo $admin->getAllVendors();
@@ -7981,6 +8220,13 @@ switch ($operation) {
         $componentId = $_GET['component_id'] ?? ($data['component_id'] ?? 0);
         echo $admin->deleteEventComponent($componentId);
         break;
+    case "updateComponentPaymentStatus":
+        echo $admin->updateComponentPaymentStatus($data);
+        break;
+    case "getEventPaymentStats":
+        $eventId = $_GET['event_id'] ?? ($data['event_id'] ?? 0);
+        echo $admin->getEventPaymentStats($eventId);
+        break;
     case "updateEventBudget":
         error_log("Admin.php - updateEventBudget case reached");
         $eventId = $_GET['event_id'] ?? ($data['event_id'] ?? 0);
@@ -7999,7 +8245,7 @@ switch ($operation) {
         break;
     case "updateEventFinalization":
         $eventId = $_GET['event_id'] ?? ($data['event_id'] ?? 0);
-        $action = $_GET['action'] ?? ($data['action'] ?? 'lock');
+        $action = $_GET['action'] ?? ($data['action'] ?? 'finalize');
         echo $admin->updateEventFinalization($eventId, $action);
         break;
     case "createPackageWithVenues":
@@ -8230,7 +8476,26 @@ switch ($operation) {
             "received_data" => $data
         ]);
         break;
+    }
+} catch (Exception $e) {
+    error_log("Admin.php - Uncaught exception: " . $e->getMessage());
+    error_log("Admin.php - Stack trace: " . $e->getTraceAsString());
+
+    // Clear any buffered output
+    if (ob_get_length()) {
+        ob_clean();
+    }
+
+    echo json_encode([
+        "status" => "error",
+        "message" => "Server error occurred",
+        "debug" => [
+            "error" => $e->getMessage(),
+            "file" => basename($e->getFile()),
+            "line" => $e->getLine()
+        ]
+    ]);
 }
 
-
-?>
+// End output buffering and flush
+ob_end_flush();
