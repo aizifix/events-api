@@ -642,6 +642,8 @@ class Admin {
         }
     }
 
+
+
     // Placeholder methods for missing functionality - these prevent fatal errors
     // ==================== SUPPLIER MANAGEMENT ====================
 
@@ -7794,6 +7796,309 @@ Event Coordination System Team
             error_log("Failed to log organizer activity: " . $e->getMessage());
         }
     }
+
+    public function getActivityTimeline($adminId, $startDate = null, $endDate = null, $page = 1, $limit = 10) {
+        try {
+            // Debug: If no dates provided, get all data from the last 6 months
+            if (!$startDate) $startDate = date('Y-m-d', strtotime('-6 months'));
+            if (!$endDate) $endDate = date('Y-m-d', strtotime('+1 day'));
+            
+            // Calculate offset for pagination
+            $offset = ($page - 1) * $limit;
+
+            $timeline = [];
+            $totalCount = 0;
+
+            // 1. Get Events (Event Creation) with more details
+            $eventsSql = "SELECT 
+                            'event_created' as action_type,
+                            e.created_at as timestamp,
+                            CONCAT('Event \"', e.event_title, '\" created by client ', u.user_firstName, ' ', u.user_lastName) as description,
+                            CONCAT(u.user_firstName, ' ', u.user_lastName) as user_name,
+                            'client' as user_type,
+                            e.event_id as related_id,
+                            'event' as entity_type,
+                            e.event_title as event_title,
+                            e.event_date as event_date,
+                            e.start_time as start_time,
+                            e.end_time as end_time,
+                            u.user_email as user_email,
+                            u.user_contact as user_contact
+                         FROM tbl_events e
+                         JOIN tbl_users u ON e.user_id = u.user_id
+                         WHERE e.created_at BETWEEN ? AND ?";
+
+            $stmt = $this->conn->prepare($eventsSql);
+            $stmt->execute([$startDate, $endDate]);
+            $events = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $timeline = array_merge($timeline, $events);
+            
+            // Debug logging
+            error_log("Events found: " . count($events));
+            error_log("Date range: $startDate to $endDate");
+            error_log("Admin ID: $adminId");
+
+            // 2. Get Payment Activities with more details
+            $paymentsSql = "SELECT 
+                              'payment_received' as action_type,
+                              pl.created_at as timestamp,
+                              CONCAT('Payment of ₱', FORMAT(pl.amount, 2), ' received for event \"', e.event_title, '\"') as description,
+                              CONCAT(u.user_firstName, ' ', u.user_lastName) as user_name,
+                              'client' as user_type,
+                              pl.event_id as related_id,
+                              'payment' as entity_type,
+                              e.event_title as event_title,
+                              pl.amount as payment_amount,
+                              p.payment_method as payment_method,
+                              pl.reference_number as reference_number,
+                              u.user_email as user_email,
+                              u.user_contact as user_contact
+                           FROM tbl_payment_logs pl
+                           JOIN tbl_events e ON pl.event_id = e.event_id
+                           JOIN tbl_users u ON pl.client_id = u.user_id
+                           LEFT JOIN tbl_payments p ON pl.payment_id = p.payment_id
+                           WHERE pl.created_at BETWEEN ? AND ?
+                           AND pl.action_type = 'payment_received'";
+
+            $stmt = $this->conn->prepare($paymentsSql);
+            $stmt->execute([$startDate, $endDate]);
+            $payments = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $timeline = array_merge($timeline, $payments);
+            
+            // Debug logging
+            error_log("Payments found: " . count($payments));
+
+            // 3. Get Payment Confirmations with more details
+            $confirmationsSql = "SELECT 
+                                  'payment_confirmed' as action_type,
+                                  pl.created_at as timestamp,
+                                  CONCAT('Payment of ₱', FORMAT(pl.amount, 2), ' confirmed for event \"', e.event_title, '\"') as description,
+                                  CONCAT(u.user_firstName, ' ', u.user_lastName) as user_name,
+                                  'client' as user_type,
+                                  pl.event_id as related_id,
+                                  'payment' as entity_type,
+                                  e.event_title as event_title,
+                                  pl.amount as payment_amount,
+                                  p.payment_method as payment_method,
+                                  pl.reference_number as reference_number,
+                                  u.user_email as user_email,
+                                  u.user_contact as user_contact
+                               FROM tbl_payment_logs pl
+                               JOIN tbl_events e ON pl.event_id = e.event_id
+                               JOIN tbl_users u ON pl.client_id = u.user_id
+                               LEFT JOIN tbl_payments p ON pl.payment_id = p.payment_id
+                               WHERE pl.created_at BETWEEN ? AND ?
+                               AND pl.action_type = 'payment_confirmed'";
+
+            $stmt = $this->conn->prepare($confirmationsSql);
+            $stmt->execute([$startDate, $endDate]);
+            $confirmations = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $timeline = array_merge($timeline, $confirmations);
+
+            // 4. Get Booking Activities with more details
+            $bookingSql = "SELECT 
+                            'booking_created' as action_type,
+                            b.created_at as timestamp,
+                            CONCAT('Booking #', b.booking_reference, ' created by ', u.user_firstName, ' ', u.user_lastName, ' for event \"', e.event_title, '\"') as description,
+                            CONCAT(u.user_firstName, ' ', u.user_lastName) as user_name,
+                            'client' as user_type,
+                            b.booking_id as related_id,
+                            'booking' as entity_type,
+                            e.event_title as event_title,
+                            b.booking_reference as booking_reference,
+                            b.booking_status as booking_status,
+                            e.total_budget as total_amount,
+                            u.user_email as user_email,
+                            u.user_contact as user_contact
+                         FROM tbl_bookings b
+                         JOIN tbl_users u ON b.user_id = u.user_id
+                         LEFT JOIN tbl_events e ON b.booking_reference = e.original_booking_reference
+                         WHERE b.created_at BETWEEN ? AND ?";
+
+            $stmt = $this->conn->prepare($bookingSql);
+            $stmt->execute([$startDate, $endDate]);
+            $bookingActivities = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $timeline = array_merge($timeline, $bookingActivities);
+
+            // 5. Get Organizer Activities
+            $organizerSql = "SELECT 
+                               'organizer_activity' as action_type,
+                               oal.created_at as timestamp,
+                               CONCAT('Organizer ', u.user_firstName, ' ', u.user_lastName, ' - ', oal.activity_type, ': ', oal.description) as description,
+                               CONCAT(u.user_firstName, ' ', u.user_lastName) as user_name,
+                               'organizer' as user_type,
+                               oal.organizer_id as related_id,
+                               'organizer' as entity_type,
+                               u.user_email as user_email,
+                               u.user_contact as user_contact
+                            FROM tbl_organizer_activity_logs oal
+                            JOIN tbl_organizer o ON oal.organizer_id = o.organizer_id
+                            JOIN tbl_users u ON o.user_id = u.user_id
+                            WHERE oal.created_at BETWEEN ? AND ?";
+
+            $stmt = $this->conn->prepare($organizerSql);
+            $stmt->execute([$startDate, $endDate]);
+            $organizerActivities = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $timeline = array_merge($timeline, $organizerActivities);
+
+            // 6. Get Supplier Activities
+            $supplierSql = "SELECT 
+                              'supplier_activity' as action_type,
+                              sa.created_at as timestamp,
+                              CONCAT('Supplier ', s.business_name, ' - ', sa.activity_type, ': ', sa.activity_description) as description,
+                              s.business_name as user_name,
+                              'supplier' as user_type,
+                              sa.supplier_id as related_id,
+                              'supplier' as entity_type,
+                              s.contact_email as user_email,
+                              s.contact_number as user_contact
+                           FROM tbl_supplier_activity sa
+                           JOIN tbl_suppliers s ON sa.supplier_id = s.supplier_id
+                           WHERE sa.created_at BETWEEN ? AND ?";
+
+            $stmt = $this->conn->prepare($supplierSql);
+            $stmt->execute([$startDate, $endDate]);
+            $supplierActivities = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $timeline = array_merge($timeline, $supplierActivities);
+
+            // 7. Get Package Creation Activities
+            $packageSql = "SELECT 
+                             'package_created' as action_type,
+                             p.created_at as timestamp,
+                             CONCAT('Package \"', p.package_title, '\" created with price ₱', FORMAT(p.package_price, 2)) as description,
+                             'Admin' as user_name,
+                             'admin' as user_type,
+                             p.package_id as related_id,
+                             'package' as entity_type,
+                             p.package_title as package_title,
+                             p.package_price as package_price,
+                             p.guest_capacity as guest_capacity
+                          FROM tbl_packages p
+                          WHERE p.created_at BETWEEN ? AND ?";
+
+            $stmt = $this->conn->prepare($packageSql);
+            $stmt->execute([$startDate, $endDate]);
+            $packageActivities = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $timeline = array_merge($timeline, $packageActivities);
+
+            // 8. Get Venue Creation Activities
+            $venueSql = "SELECT 
+                           'venue_created' as action_type,
+                           v.created_at as timestamp,
+                           CONCAT('Venue \"', v.venue_title, '\" created with capacity ', v.venue_capacity, ' and price ₱', FORMAT(v.venue_price, 2)) as description,
+                           'Admin' as user_name,
+                           'admin' as user_type,
+                           v.venue_id as related_id,
+                           'venue' as entity_type,
+                           v.venue_title as venue_title,
+                           v.venue_capacity as venue_capacity,
+                           v.venue_price as venue_price,
+                           v.venue_location as venue_location
+                        FROM tbl_venue v
+                        WHERE v.created_at BETWEEN ? AND ?";
+
+            $stmt = $this->conn->prepare($venueSql);
+            $stmt->execute([$startDate, $endDate]);
+            $venueActivities = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $timeline = array_merge($timeline, $venueActivities);
+
+            // 9. Get Supplier Creation Activities
+            $supplierCreationSql = "SELECT 
+                                     'supplier_created' as action_type,
+                                     s.created_at as timestamp,
+                                     CONCAT('Supplier \"', s.business_name, '\" created in ', s.specialty_category, ' category') as description,
+                                     'Admin' as user_name,
+                                     'admin' as user_type,
+                                     s.supplier_id as related_id,
+                                     'supplier' as entity_type,
+                                     s.business_name as business_name,
+                                     s.specialty_category as specialty_category,
+                                     s.contact_email as user_email,
+                                     s.contact_number as user_contact
+                                  FROM tbl_suppliers s
+                                  WHERE s.created_at BETWEEN ? AND ?";
+
+            $stmt = $this->conn->prepare($supplierCreationSql);
+            $stmt->execute([$startDate, $endDate]);
+            $supplierCreationActivities = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $timeline = array_merge($timeline, $supplierCreationActivities);
+
+            // 10. Get Email Activities
+            $emailSql = "SELECT 
+                           'email_sent' as action_type,
+                           el.created_at as timestamp,
+                           CONCAT('Email sent to ', el.recipient_name, ' (', el.email_type, ')') as description,
+                           el.recipient_name as user_name,
+                           'system' as user_type,
+                           el.email_log_id as related_id,
+                           'email' as entity_type,
+                           el.recipient_email as user_email,
+                           el.email_type as email_type
+                        FROM tbl_email_logs el
+                        WHERE el.created_at BETWEEN ? AND ?
+                        AND el.sent_status = 'sent'";
+
+            $stmt = $this->conn->prepare($emailSql);
+            $stmt->execute([$startDate, $endDate]);
+            $emailActivities = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            $timeline = array_merge($timeline, $emailActivities);
+
+            // Sort timeline by timestamp (newest first)
+            usort($timeline, function($a, $b) {
+                return strtotime($b['timestamp']) - strtotime($a['timestamp']);
+            });
+
+            // Get total count before pagination
+            $totalCount = count($timeline);
+
+            // Apply pagination
+            $timeline = array_slice($timeline, $offset, $limit);
+
+            // Calculate pagination info
+            $totalPages = ceil($totalCount / $limit);
+            $hasNextPage = $page < $totalPages;
+            $hasPrevPage = $page > 1;
+
+            // Debug logging for final result
+            error_log("Total timeline items: " . count($timeline));
+            error_log("Total count: " . $totalCount);
+            error_log("Date range: $startDate to $endDate");
+            error_log("Admin ID: $adminId");
+            
+            return json_encode([
+                "status" => "success",
+                "timeline" => $timeline,
+                "pagination" => [
+                    "currentPage" => $page,
+                    "totalPages" => $totalPages,
+                    "totalItems" => $totalCount,
+                    "itemsPerPage" => $limit,
+                    "hasNextPage" => $hasNextPage,
+                    "hasPrevPage" => $hasPrevPage,
+                    "showing" => count($timeline),
+                    "showingText" => "Showing " . count($timeline) . " out of " . $totalCount . " transactions"
+                ],
+                "dateRange" => [
+                    "startDate" => $startDate,
+                    "endDate" => $endDate
+                ],
+                "summary" => [
+                    "totalEvents" => count(array_filter($timeline, function($item) { return $item['entity_type'] === 'event'; })),
+                    "totalPayments" => count(array_filter($timeline, function($item) { return $item['entity_type'] === 'payment'; })),
+                    "totalBookings" => count(array_filter($timeline, function($item) { return $item['entity_type'] === 'booking'; })),
+                    "totalOrganizers" => count(array_filter($timeline, function($item) { return $item['entity_type'] === 'organizer'; })),
+                    "totalSuppliers" => count(array_filter($timeline, function($item) { return $item['entity_type'] === 'supplier'; })),
+                    "totalPackages" => count(array_filter($timeline, function($item) { return $item['entity_type'] === 'package'; })),
+                    "totalVenues" => count(array_filter($timeline, function($item) { return $item['entity_type'] === 'venue'; })),
+                    "totalEmails" => count(array_filter($timeline, function($item) { return $item['entity_type'] === 'email'; }))
+                ]
+            ]);
+
+        } catch (Exception $e) {
+            error_log("getActivityTimeline error: " . $e->getMessage());
+            return json_encode(["status" => "error", "message" => "Database error: " . $e->getMessage()]);
+        }
+    }
 }
 
 if (!$pdo) {
@@ -8112,6 +8417,14 @@ try {
         $startDate = $_GET['start_date'] ?? ($data['start_date'] ?? null);
         $endDate = $_GET['end_date'] ?? ($data['end_date'] ?? null);
         echo $admin->getReportsData($adminId, $reportType, $startDate, $endDate);
+        break;
+    case "getActivityTimeline":
+        $adminId = $_GET['admin_id'] ?? ($data['admin_id'] ?? 0);
+        $startDate = $_GET['start_date'] ?? ($data['start_date'] ?? null);
+        $endDate = $_GET['end_date'] ?? ($data['end_date'] ?? null);
+        $page = (int)($_GET['page'] ?? ($data['page'] ?? 1));
+        $limit = (int)($_GET['limit'] ?? ($data['limit'] ?? 10));
+        echo $admin->getActivityTimeline($adminId, $startDate, $endDate, $page, $limit);
         break;
     case "getUserProfile":
         $userId = $_GET['user_id'] ?? ($data['user_id'] ?? 0);
