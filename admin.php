@@ -157,7 +157,7 @@ class Admin {
                     FROM tbl_events
                     WHERE event_date = ?
                     AND event_type_id = 1
-                    AND event_status NOT IN ('cancelled', 'completed')
+                    AND event_status NOT IN ('cancelled', 'done')
                     LIMIT 1
                 ");
                 $weddingCheck->execute([$data['event_date']]);
@@ -177,7 +177,7 @@ class Admin {
                     FROM tbl_events
                     WHERE event_date = ?
                     AND event_type_id != 1
-                    AND event_status NOT IN ('cancelled', 'completed')
+                    AND event_status NOT IN ('cancelled', 'done')
                 ");
                 $otherEventsCheck->execute([$data['event_date']]);
                 $otherEvents = $otherEventsCheck->fetchAll();
@@ -197,7 +197,7 @@ class Admin {
                     FROM tbl_events
                     WHERE event_date = ?
                     AND event_type_id = 1
-                    AND event_status NOT IN ('cancelled', 'completed')
+                    AND event_status NOT IN ('cancelled', 'done')
                     LIMIT 1
                 ");
                 $weddingCheck->execute([$data['event_date']]);
@@ -2150,6 +2150,7 @@ This is an automated message. Please do not reply.
                             v.venue_details,
                             v.venue_capacity,
                             v.venue_price,
+                            COALESCE(v.extra_pax_rate, 0) AS extra_pax_rate,
                             v.venue_type,
                             v.venue_profile_picture,
                             v.venue_cover_photo
@@ -3082,37 +3083,8 @@ This is an automated message. Please do not reply.
                 $stmt->execute([$eventId]);
                 $event['payments'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-                // Get payment proofs/attachments
-                $stmt = $this->pdo->prepare("
-                    SELECT
-                        payment_id,
-                        payment_amount,
-                        payment_date,
-                        payment_method,
-                        payment_status,
-                        payment_reference,
-                        payment_notes as description,
-                        created_at
-                    FROM tbl_payments
-                    WHERE event_id = ? AND payment_reference IS NOT NULL
-                    ORDER BY payment_date DESC
-                ");
-                $stmt->execute([$eventId]);
-                $paymentProofs = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-                // Add payment proofs to attachments if they exist
-                foreach ($paymentProofs as $proof) {
-                    if (!empty($proof['payment_reference'])) {
-                        $event['attachments'][] = [
-                            'file_name' => "Payment Proof - " . $proof['payment_reference'],
-                            'file_path' => $proof['payment_reference'],
-                            'file_type' => 'payment_proof',
-                            'upload_date' => $proof['payment_date'],
-                            'file_size' => null,
-                            'description' => $proof['description'] ?? 'Payment proof document'
-                        ];
-                    }
-                }
+                // Do not merge payment proofs into event attachments.
+                // The Files tab should only show event/theme attachments from tbl_events.event_attachments.
 
                 return json_encode([
                     "status" => "success",
@@ -4244,10 +4216,10 @@ This is an automated message. Please do not reply.
             $stmt->execute([$adminId]);
             $metrics['totalClients'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-            // Get completed events
+            // Get completed (done) events
             $completedSql = "SELECT COUNT(*) as total
                             FROM tbl_events
-                            WHERE admin_id = ? AND event_status = 'completed'";
+                            WHERE admin_id = ? AND event_status = 'done'";
             $stmt = $this->conn->prepare($completedSql);
             $stmt->execute([$adminId]);
             $metrics['completedEvents'] = $stmt->fetch(PDO::FETCH_ASSOC)['total'];
@@ -4296,10 +4268,10 @@ This is an automated message. Please do not reply.
 
             $clientsGrowth = $lastMonthClients > 0 ? (($currentMonthClients - $lastMonthClients) / $lastMonthClients) * 100 : 0;
 
-            // Completed events growth
+            // Done events growth
             $currentMonthCompletedSql = "SELECT COUNT(*) as total
                                         FROM tbl_events
-                                        WHERE admin_id = ? AND event_status = 'completed'
+                                        WHERE admin_id = ? AND event_status = 'done'
                                         AND DATE_FORMAT(updated_at, '%Y-%m') = ?";
             $stmt = $this->conn->prepare($currentMonthCompletedSql);
             $stmt->execute([$adminId, $currentMonth]);
@@ -4341,7 +4313,7 @@ This is an automated message. Please do not reply.
                     LEFT JOIN tbl_users u ON e.user_id = u.user_id
                     WHERE e.admin_id = ?
                     AND e.event_date >= CURDATE()
-                    AND e.event_status IN ('draft', 'confirmed', 'in-progress')
+                    AND e.event_status IN ('draft', 'confirmed', 'on_going')
                     ORDER BY e.event_date ASC
                     LIMIT ?";
 
@@ -6632,11 +6604,13 @@ This is an automated message. Please do not reply.
             $sql = "INSERT INTO tbl_event_components (
                         event_id, component_name, component_description,
                         component_price, is_custom, is_included,
-                        original_package_component_id, supplier_id, offer_id, display_order
+                        original_package_component_id, supplier_id, offer_id, display_order,
+                        payment_status, payment_date, payment_notes
                     ) VALUES (
                         :event_id, :name, :description,
                         :price, :is_custom, :is_included,
-                        :original_package_component_id, :supplier_id, :offer_id, :display_order
+                        :original_package_component_id, :supplier_id, :offer_id, :display_order,
+                        :payment_status, :payment_date, :payment_notes
                     )";
 
             $stmt = $this->conn->prepare($sql);
@@ -6650,7 +6624,10 @@ This is an automated message. Please do not reply.
                 ':original_package_component_id' => $data['original_package_component_id'] ?? null,
                 ':supplier_id' => $data['supplier_id'] ?? null,
                 ':offer_id' => $data['offer_id'] ?? null,
-                ':display_order' => $data['display_order'] ?? 0
+                ':display_order' => $data['display_order'] ?? 0,
+                ':payment_status' => $data['payment_status'] ?? 'pending',
+                ':payment_date' => (isset($data['payment_status']) && $data['payment_status'] === 'paid') ? date('Y-m-d H:i:s') : null,
+                ':payment_notes' => $data['payment_notes'] ?? null
             ]);
 
             if ($result) {
@@ -6758,7 +6735,7 @@ This is an automated message. Please do not reply.
                 return json_encode(["status" => "error", "message" => "Component ID and payment status are required"]);
             }
 
-            $validStatuses = ['pending', 'paid'];
+            $validStatuses = ['pending', 'paid', 'cancelled'];
             if (!in_array($data['payment_status'], $validStatuses)) {
                 return json_encode(["status" => "error", "message" => "Invalid payment status"]);
             }
@@ -6817,8 +6794,11 @@ This is an automated message. Please do not reply.
             $stmt->execute([$eventId]);
             $currentBudget = $stmt->fetch(PDO::FETCH_ASSOC)['total_budget'];
 
-            // Calculate new budget
+            // Calculate new budget and prevent negative values
             $newBudget = $currentBudget + $budgetChange;
+            if ($newBudget < 0) {
+                $newBudget = 0;
+            }
 
             // Update event budget
             $updateSql = "UPDATE tbl_events SET total_budget = ? WHERE event_id = ?";
@@ -6969,25 +6949,25 @@ This is an automated message. Please do not reply.
             }
 
             if ($action === "finalize") {
-                // Check if all included components have finalized inclusion status
-                $inclusionCheckSql = "SELECT
+                // Check if all included components are fully paid
+                $paymentCheckSql = "SELECT
                     COUNT(*) as total_included,
-                    SUM(CASE WHEN supplier_status = 'delivered' THEN 1 ELSE 0 END) as finalized_inclusions
+                    SUM(CASE WHEN payment_status = 'paid' THEN 1 ELSE 0 END) as paid_inclusions
                     FROM tbl_event_components
                     WHERE event_id = ? AND is_included = 1";
-                $checkStmt = $this->pdo->prepare($inclusionCheckSql);
+                $checkStmt = $this->pdo->prepare($paymentCheckSql);
                 $checkStmt->execute([$eventId]);
-                $inclusionStats = $checkStmt->fetch(PDO::FETCH_ASSOC);
+                $paymentStats = $checkStmt->fetch(PDO::FETCH_ASSOC);
 
-                if ($inclusionStats['total_included'] > 0 && $inclusionStats['finalized_inclusions'] < $inclusionStats['total_included']) {
+                if ($paymentStats['total_included'] > 0 && $paymentStats['paid_inclusions'] < $paymentStats['total_included']) {
                     return json_encode([
                         "status" => "error",
-                        "message" => "Cannot finalize event. All inclusion statuses must be finalized (delivered) first.",
-                        "pending_inclusions" => $inclusionStats['total_included'] - $inclusionStats['finalized_inclusions']
+                        "message" => "Cannot finalize event. All included components must be paid first.",
+                        "pending_inclusions" => $paymentStats['total_included'] - $paymentStats['paid_inclusions']
                     ]);
                 }
 
-                // Finalize the event (no locking, remains editable until event starts)
+                // Finalize the event and mark as confirmed (upcoming)
                 $updateSql = "UPDATE tbl_events SET
                              event_status = 'confirmed',
                              finalized_at = NOW(),
@@ -7001,7 +6981,7 @@ This is an automated message. Please do not reply.
 
                 return json_encode([
                     "status" => "success",
-                    "message" => "Event has been finalized. Event remains editable until the event starts.",
+                    "message" => "Event has been finalized and marked as confirmed.",
                     "finalized_at" => date('Y-m-d H:i:s')
                 ]);
             } else {
@@ -7802,7 +7782,7 @@ Event Coordination System Team
             // Debug: If no dates provided, get all data from the last 6 months
             if (!$startDate) $startDate = date('Y-m-d', strtotime('-6 months'));
             if (!$endDate) $endDate = date('Y-m-d', strtotime('+1 day'));
-            
+
             // Calculate offset for pagination
             $offset = ($page - 1) * $limit;
 
@@ -7810,7 +7790,7 @@ Event Coordination System Team
             $totalCount = 0;
 
             // 1. Get Events (Event Creation) with more details
-            $eventsSql = "SELECT 
+            $eventsSql = "SELECT
                             'event_created' as action_type,
                             e.created_at as timestamp,
                             CONCAT('Event \"', e.event_title, '\" created by client ', u.user_firstName, ' ', u.user_lastName) as description,
@@ -7832,14 +7812,14 @@ Event Coordination System Team
             $stmt->execute([$startDate, $endDate]);
             $events = $stmt->fetchAll(PDO::FETCH_ASSOC);
             $timeline = array_merge($timeline, $events);
-            
+
             // Debug logging
             error_log("Events found: " . count($events));
             error_log("Date range: $startDate to $endDate");
             error_log("Admin ID: $adminId");
 
             // 2. Get Payment Activities with more details
-            $paymentsSql = "SELECT 
+            $paymentsSql = "SELECT
                               'payment_received' as action_type,
                               pl.created_at as timestamp,
                               CONCAT('Payment of ₱', FORMAT(pl.amount, 2), ' received for event \"', e.event_title, '\"') as description,
@@ -7864,12 +7844,12 @@ Event Coordination System Team
             $stmt->execute([$startDate, $endDate]);
             $payments = $stmt->fetchAll(PDO::FETCH_ASSOC);
             $timeline = array_merge($timeline, $payments);
-            
+
             // Debug logging
             error_log("Payments found: " . count($payments));
 
             // 3. Get Payment Confirmations with more details
-            $confirmationsSql = "SELECT 
+            $confirmationsSql = "SELECT
                                   'payment_confirmed' as action_type,
                                   pl.created_at as timestamp,
                                   CONCAT('Payment of ₱', FORMAT(pl.amount, 2), ' confirmed for event \"', e.event_title, '\"') as description,
@@ -7896,7 +7876,7 @@ Event Coordination System Team
             $timeline = array_merge($timeline, $confirmations);
 
             // 4. Get Booking Activities with more details
-            $bookingSql = "SELECT 
+            $bookingSql = "SELECT
                             'booking_created' as action_type,
                             b.created_at as timestamp,
                             CONCAT('Booking #', b.booking_reference, ' created by ', u.user_firstName, ' ', u.user_lastName, ' for event \"', e.event_title, '\"') as description,
@@ -7921,7 +7901,7 @@ Event Coordination System Team
             $timeline = array_merge($timeline, $bookingActivities);
 
             // 5. Get Organizer Activities
-            $organizerSql = "SELECT 
+            $organizerSql = "SELECT
                                'organizer_activity' as action_type,
                                oal.created_at as timestamp,
                                CONCAT('Organizer ', u.user_firstName, ' ', u.user_lastName, ' - ', oal.activity_type, ': ', oal.description) as description,
@@ -7942,7 +7922,7 @@ Event Coordination System Team
             $timeline = array_merge($timeline, $organizerActivities);
 
             // 6. Get Supplier Activities
-            $supplierSql = "SELECT 
+            $supplierSql = "SELECT
                               'supplier_activity' as action_type,
                               sa.created_at as timestamp,
                               CONCAT('Supplier ', s.business_name, ' - ', sa.activity_type, ': ', sa.activity_description) as description,
@@ -7962,7 +7942,7 @@ Event Coordination System Team
             $timeline = array_merge($timeline, $supplierActivities);
 
             // 7. Get Package Creation Activities
-            $packageSql = "SELECT 
+            $packageSql = "SELECT
                              'package_created' as action_type,
                              p.created_at as timestamp,
                              CONCAT('Package \"', p.package_title, '\" created with price ₱', FORMAT(p.package_price, 2)) as description,
@@ -7982,7 +7962,7 @@ Event Coordination System Team
             $timeline = array_merge($timeline, $packageActivities);
 
             // 8. Get Venue Creation Activities
-            $venueSql = "SELECT 
+            $venueSql = "SELECT
                            'venue_created' as action_type,
                            v.created_at as timestamp,
                            CONCAT('Venue \"', v.venue_title, '\" created with capacity ', v.venue_capacity, ' and price ₱', FORMAT(v.venue_price, 2)) as description,
@@ -8003,7 +7983,7 @@ Event Coordination System Team
             $timeline = array_merge($timeline, $venueActivities);
 
             // 9. Get Supplier Creation Activities
-            $supplierCreationSql = "SELECT 
+            $supplierCreationSql = "SELECT
                                      'supplier_created' as action_type,
                                      s.created_at as timestamp,
                                      CONCAT('Supplier \"', s.business_name, '\" created in ', s.specialty_category, ' category') as description,
@@ -8024,7 +8004,7 @@ Event Coordination System Team
             $timeline = array_merge($timeline, $supplierCreationActivities);
 
             // 10. Get Email Activities
-            $emailSql = "SELECT 
+            $emailSql = "SELECT
                            'email_sent' as action_type,
                            el.created_at as timestamp,
                            CONCAT('Email sent to ', el.recipient_name, ' (', el.email_type, ')') as description,
@@ -8064,7 +8044,7 @@ Event Coordination System Team
             error_log("Total count: " . $totalCount);
             error_log("Date range: $startDate to $endDate");
             error_log("Admin ID: $adminId");
-            
+
             return json_encode([
                 "status" => "success",
                 "timeline" => $timeline,
