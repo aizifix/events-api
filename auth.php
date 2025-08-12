@@ -10,6 +10,7 @@ date_default_timezone_set('Asia/Manila');
 
 require_once 'db_connect.php';
 require 'vendor/autoload.php';
+require_once 'ActivityLogger.php';
 
 // PHP Mailer OTP
 use PHPMailer\PHPMailer\PHPMailer;
@@ -17,9 +18,11 @@ use PHPMailer\PHPMailer\Exception;
 
 class Auth {
     private $conn;
+    private $logger;
 
     public function __construct($db) {
         $this->conn = $db;
+        $this->logger = new ActivityLogger($db);
     }
 
     public function sendOTP($email, $user_id) {
@@ -238,12 +241,20 @@ class Auth {
         $stmt->execute([':email' => $email]);
 
         if ($stmt->rowCount() === 0) {
+            // Log failed login attempt - user not found
+            if ($this->logger) {
+                $this->logger->logAuth(0, 'login_attempt', "Failed login attempt for non-existent user: $email", 'unknown', false, 'User not found');
+            }
             return json_encode(["status" => "error", "message" => "User not found."]);
         }
 
         $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
         if (!password_verify($password, $user['user_pwd'])) {
+            // Log failed login attempt - invalid password
+            if ($this->logger) {
+                $this->logger->logAuth($user['user_id'], 'login_attempt', "Failed login attempt for {$user['user_firstName']} {$user['user_lastName']}", $user['user_role'], false, 'Invalid password');
+            }
             return json_encode(["status" => "error", "message" => "Invalid password."]);
         }
 
@@ -340,6 +351,17 @@ class Auth {
             // Update last login timestamp
             $this->conn->prepare("UPDATE tbl_users SET last_login = NOW() WHERE user_id = :user_id")
                 ->execute([':user_id' => $user_id]);
+
+            // Log successful login using ActivityLogger
+            if ($this->logger) {
+                $this->logger->logAuth(
+                    $user_id,
+                    'login',
+                    "User {$user['user_firstName']} {$user['user_lastName']} logged in successfully",
+                    $user['user_role'],
+                    true
+                );
+            }
 
             // Log supplier activity if user is a supplier
             if ($user['user_role'] === 'supplier') {
@@ -788,6 +810,84 @@ class Auth {
         }
     }
 
+    // Ensure a generic user activity logs table exists
+    private function ensureUserActivityTable() {
+        try {
+            $sql = "CREATE TABLE IF NOT EXISTS tbl_user_activity_logs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                action_type ENUM('login','logout','signup','event_created','booking_created','payment_received','admin_action','booking_accepted','booking_rejected') NOT NULL,
+                description TEXT NULL,
+                user_role ENUM('admin','organizer','client','supplier','staff') NOT NULL,
+                ip_address VARCHAR(64) NULL,
+                user_agent TEXT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_user_activity_user (user_id),
+                INDEX idx_user_activity_action (action_type),
+                INDEX idx_user_activity_date (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci";
+            $this->conn->exec($sql);
+        } catch (Exception $e) {
+            error_log("Failed ensuring tbl_user_activity_logs: " . $e->getMessage());
+        }
+    }
+
+    // Log a generic user logout
+    public function logout($userId) {
+        try {
+            if (empty($userId)) {
+                return json_encode(["status" => "error", "message" => "Missing user_id"]);
+            }
+
+            // Fetch user
+            $stmt = $this->conn->prepare("SELECT user_id, user_firstName, user_lastName, user_role FROM tbl_users WHERE user_id = :user_id");
+            $stmt->execute([':user_id' => $userId]);
+            $user = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$user) {
+                return json_encode(["status" => "error", "message" => "User not found"]);
+            }
+
+            // Supplier-specific activity log
+            if (strtolower($user['user_role']) === 'supplier') {
+                try {
+                    $supplierStmt = $this->conn->prepare("SELECT supplier_id FROM tbl_suppliers WHERE user_id = :user_id AND is_active = 1");
+                    $supplierStmt->execute([':user_id' => $userId]);
+                    $supplier = $supplierStmt->fetch(PDO::FETCH_ASSOC);
+                    if ($supplier) {
+                        $activityStmt = $this->conn->prepare("
+                            INSERT INTO tbl_supplier_activity (
+                                supplier_id, activity_type, activity_description, ip_address, user_agent, created_at
+                            ) VALUES (?, 'logout', 'Supplier logged out', ?, ?, NOW())
+                        ");
+                        $activityStmt->execute([
+                            $supplier['supplier_id'],
+                            $_SERVER['REMOTE_ADDR'] ?? null,
+                            $_SERVER['HTTP_USER_AGENT'] ?? null
+                        ]);
+                    }
+                } catch (Exception $e) {
+                    error_log("Failed to log supplier logout: " . $e->getMessage());
+                }
+            }
+
+            // Log logout using ActivityLogger
+            if ($this->logger) {
+                $this->logger->logAuth(
+                    $userId,
+                    'logout',
+                    "User {$user['user_firstName']} {$user['user_lastName']} logged out",
+                    $user['user_role'],
+                    true
+                );
+            }
+
+            return json_encode(["status" => "success", "message" => "Logout recorded"]);
+        } catch (Exception $e) {
+            error_log("Logout error: " . $e->getMessage());
+            return json_encode(["status" => "error", "message" => "Failed to record logout"]);
+        }
+    }
     // Log supplier password change activity
     private function logSupplierPasswordChange($userId) {
         try {
@@ -1032,6 +1132,10 @@ try {
 switch ($operation) {
     case "login":
         echo $auth->login($_POST['email'] ?? ($jsonData['email'] ?? ''), $_POST['password'] ?? ($jsonData['password'] ?? ''));
+        break;
+    case "logout":
+        $uid = $_POST['user_id'] ?? ($jsonData['user_id'] ?? '');
+        echo $auth->logout($uid);
         break;
         case "register":
         // Use JSON data if available, otherwise use $_POST

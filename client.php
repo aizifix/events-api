@@ -1,12 +1,19 @@
 <?php
 // Include the database connection
 require_once 'db_connect.php';
+require_once 'ActivityLogger.php';
 
 // Set headers for CORS and content type
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type, Authorization");
 header('Content-Type: application/json');
+
+// Initialize global logger
+$logger = null;
+if (isset($pdo)) {
+    $logger = new ActivityLogger($pdo);
+}
 
 // Handle preflight OPTIONS request
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -392,30 +399,188 @@ function createBooking($data) {
         $stmt->execute();
         $bookingId = $pdo->lastInsertId();
 
-        // Create notification for admin (with error handling)
+        // Create notifications (admin recipients and client) - non-blocking
         try {
-            $notificationSql = "INSERT INTO tbl_notifications (
-                    user_id, booking_id, notification_message, notification_status
-                ) VALUES (
-                    (SELECT user_id FROM tbl_users WHERE user_role = 'admin' LIMIT 1),
-                    :booking_id,
-                    :notification_message,
-                    'unread'
-                )";
+            // Notify the client who created the booking
+            try {
+                $clientNotif = $pdo->prepare("CALL CreateNotification(
+                    :p_user_id,
+                    :p_type,
+                    :p_title,
+                    :p_message,
+                    :p_priority,
+                    :p_icon,
+                    :p_url,
+                    :p_event_id,
+                    :p_booking_id,
+                    :p_venue_id,
+                    :p_store_id,
+                    :p_budget_id,
+                    :p_feedback_id,
+                    :p_expires_at
+                )");
 
-            $notificationStmt = $pdo->prepare($notificationSql);
-            $notificationStmt->bindParam(':booking_id', $bookingId, PDO::PARAM_INT);
-            $notificationMessage = 'New booking created: ' . $bookingReference;
-            $notificationStmt->bindParam(':notification_message', $notificationMessage, PDO::PARAM_STR);
-            $notificationStmt->execute();
-        } catch (PDOException $notifError) {
-            // Log notification error but don't fail the booking
-            error_log("createBooking: Notification creation failed: " . $notifError->getMessage());
+                $clientNotif->execute([
+                    ':p_user_id' => (int)$data['user_id'],
+                    ':p_type' => 'booking_created',
+                    ':p_title' => 'Booking Submitted',
+                    ':p_message' => 'Your booking ' . $bookingReference . ' has been submitted and is pending confirmation.',
+                    ':p_priority' => 'medium',
+                    ':p_icon' => 'calendar-plus',
+                    ':p_url' => '/client/bookings',
+                    ':p_event_id' => null,
+                    ':p_booking_id' => (int)$bookingId,
+                    ':p_venue_id' => $venueId,
+                    ':p_store_id' => null,
+                    ':p_budget_id' => null,
+                    ':p_feedback_id' => null,
+                    ':p_expires_at' => date('Y-m-d H:i:s', strtotime('+72 hours'))
+                ]);
+            } catch (PDOException $eNotifClient) {
+                error_log('createBooking: client notification failed: ' . $eNotifClient->getMessage());
+                // Fallback: direct insert when procedure is missing
+                try {
+                    $fallback = $pdo->prepare("INSERT INTO tbl_notifications (
+                        user_id, notification_type, notification_title, notification_message,
+                        notification_priority, notification_icon, notification_url,
+                        event_id, booking_id, venue_id, store_id, budget_id, feedback_id, expires_at
+                    ) VALUES (
+                        :user_id, :type, :title, :message,
+                        :priority, :icon, :url,
+                        :event_id, :booking_id, :venue_id, :store_id, :budget_id, :feedback_id, :expires_at
+                    )");
+                    $fallback->execute([
+                        ':user_id' => (int)$data['user_id'],
+                        ':type' => 'booking_created',
+                        ':title' => 'Booking Submitted',
+                        ':message' => 'Your booking ' . $bookingReference . ' has been submitted and is pending confirmation.',
+                        ':priority' => 'medium',
+                        ':icon' => 'calendar-plus',
+                        ':url' => '/client/bookings',
+                        ':event_id' => null,
+                        ':booking_id' => (int)$bookingId,
+                        ':venue_id' => $venueId,
+                        ':store_id' => null,
+                        ':budget_id' => null,
+                        ':feedback_id' => null,
+                        ':expires_at' => date('Y-m-d H:i:s', strtotime('+72 hours'))
+                    ]);
+                } catch (PDOException $efb) {
+                    error_log('createBooking: client notification fallback failed: ' . $efb->getMessage());
+                }
+            }
+
+            // Notify all admins
+            try {
+                // Fetch admin recipients and the full name of the booking owner
+                $adminsStmt = $pdo->query("SELECT user_id FROM tbl_users WHERE user_role = 'admin'");
+                $adminIds = $adminsStmt->fetchAll(PDO::FETCH_COLUMN);
+
+                $ownerStmt = $pdo->prepare("SELECT user_firstName, user_lastName FROM tbl_users WHERE user_id = ? LIMIT 1");
+                $ownerStmt->execute([(int)$data['user_id']]);
+                $owner = $ownerStmt->fetch(PDO::FETCH_ASSOC) ?: ['user_firstName' => 'User', 'user_lastName' => (string)(int)$data['user_id']];
+                $ownerFullName = trim(($owner['user_firstName'] ?? 'User') . ' ' . ($owner['user_lastName'] ?? ''));
+
+                if ($adminIds) {
+                    $adminNotif = $pdo->prepare("CALL CreateNotification(
+                        :p_user_id,
+                        :p_type,
+                        :p_title,
+                        :p_message,
+                        :p_priority,
+                        :p_icon,
+                        :p_url,
+                        :p_event_id,
+                        :p_booking_id,
+                        :p_venue_id,
+                        :p_store_id,
+                        :p_budget_id,
+                        :p_feedback_id,
+                        :p_expires_at
+                    )");
+
+                    foreach ($adminIds as $adminId) {
+                        $adminNotif->execute([
+                            ':p_user_id' => (int)$adminId,
+                            ':p_type' => 'booking_created',
+                            ':p_title' => 'New Booking Created',
+                            ':p_message' => 'New booking ' . $bookingReference . ' created by ' . $ownerFullName . '.',
+                            ':p_priority' => 'medium',
+                            ':p_icon' => 'calendar-plus',
+                            ':p_url' => '/admin/bookings',
+                            ':p_event_id' => null,
+                            ':p_booking_id' => (int)$bookingId,
+                            ':p_venue_id' => $venueId,
+                            ':p_store_id' => null,
+                            ':p_budget_id' => null,
+                            ':p_feedback_id' => null,
+                            ':p_expires_at' => date('Y-m-d H:i:s', strtotime('+72 hours'))
+                        ]);
+                    }
+                }
+            } catch (PDOException $eNotifAdmin) {
+                error_log('createBooking: admin notification failed: ' . $eNotifAdmin->getMessage());
+                // Fallback for admin notifications
+                try {
+                    $fallback = $pdo->prepare("INSERT INTO tbl_notifications (
+                        user_id, notification_type, notification_title, notification_message,
+                        notification_priority, notification_icon, notification_url,
+                        event_id, booking_id, venue_id, store_id, budget_id, feedback_id, expires_at
+                    ) VALUES (
+                        :user_id, :type, :title, :message,
+                        :priority, :icon, :url,
+                        :event_id, :booking_id, :venue_id, :store_id, :budget_id, :feedback_id, :expires_at
+                    )");
+                    foreach ($adminIds as $adminId) {
+                        $fallback->execute([
+                            ':user_id' => (int)$adminId,
+                            ':type' => 'booking_created',
+                            ':title' => 'New Booking Created',
+                            ':message' => 'New booking ' . $bookingReference . ' created by ' . $ownerFullName . '.',
+                            ':priority' => 'medium',
+                            ':icon' => 'calendar-plus',
+                            ':url' => '/admin/bookings',
+                            ':event_id' => null,
+                            ':booking_id' => (int)$bookingId,
+                            ':venue_id' => $venueId,
+                            ':store_id' => null,
+                            ':budget_id' => null,
+                            ':feedback_id' => null,
+                            ':expires_at' => date('Y-m-d H:i:s', strtotime('+72 hours'))
+                        ]);
+                    }
+                } catch (PDOException $efb) {
+                    error_log('createBooking: admin notification fallback failed: ' . $efb->getMessage());
+                }
+            }
+        } catch (Exception $notifWrapperError) {
+            error_log('createBooking: notification wrapper error: ' . $notifWrapperError->getMessage());
         }
 
         $pdo->commit();
 
         error_log("createBooking: Success! Booking ID: " . $bookingId . ", Reference: " . $bookingReference);
+
+        // Log booking creation activity
+        global $logger;
+        if ($logger) {
+            $logger->logBooking(
+                $data['user_id'],
+                $bookingId,
+                'created',
+                "Booking {$bookingReference} created for {$data['event_name']} on {$data['event_date']} with {$data['guest_count']} guests",
+                null,
+                'pending',
+                [
+                    'booking_reference' => $bookingReference,
+                    'event_type_id' => $data['event_type_id'],
+                    'event_date' => $data['event_date'],
+                    'guest_count' => $data['guest_count'],
+                    'venue_id' => $venueId,
+                    'package_id' => $packageId
+                ]
+            );
+        }
 
         return [
             "status" => "success",
@@ -424,13 +589,17 @@ function createBooking($data) {
             "message" => "Booking created successfully"
         ];
     } catch (PDOException $e) {
-        $pdo->rollBack();
+        if ($pdo->inTransaction()) { $pdo->rollBack(); }
         error_log("createBooking: Database error: " . $e->getMessage());
-        return ["status" => "error", "message" => "Database error: " . $e->getMessage()];
+        header('Content-Type: application/json');
+        echo json_encode(["status" => "error", "message" => "Database error: " . $e->getMessage()]);
+        exit;
     } catch (Exception $e) {
-        $pdo->rollBack();
+        if ($pdo->inTransaction()) { $pdo->rollBack(); }
         error_log("createBooking: General error: " . $e->getMessage());
-        return ["status" => "error", "message" => "Error creating booking: " . $e->getMessage()];
+        header('Content-Type: application/json');
+        echo json_encode(["status" => "error", "message" => "Error creating booking: " . $e->getMessage()]);
+        exit;
     }
 }
 

@@ -4,28 +4,37 @@ header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 
+// Robust error handling: never output HTML errors in JSON endpoints
+error_reporting(E_ALL);
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
+set_error_handler(function($errno, $errstr, $errfile, $errline) {
+    http_response_code(500);
+    echo json_encode([
+        'status' => 'error',
+        'message' => 'Server error occurred',
+        'debug' => [
+            'error' => $errstr,
+            'file' => basename($errfile),
+            'line' => $errline,
+        ],
+    ]);
+    exit;
+});
+
 // Handle preflight requests
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit(0);
 }
 
-require_once '../vendor/autoload.php';
-
-// Database configuration
-$host = 'localhost';
-$dbname = 'es_v1';
-$username = 'root';
-$password = '';
-
-try {
-    $pdo = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8mb4", $username, $password);
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-} catch (PDOException $e) {
-    http_response_code(500);
-    echo json_encode(['status' => 'error', 'message' => 'Database connection failed']);
-    exit;
+// Load Composer autoload if present in the current directory's vendor folder
+$autoloadPath = __DIR__ . '/vendor/autoload.php';
+if (file_exists($autoloadPath)) {
+    require_once $autoloadPath;
 }
+
+// Use shared DB connection (es_v3) and error handling
+require_once __DIR__ . '/db_connect.php';
 
 class NotificationManager
 {

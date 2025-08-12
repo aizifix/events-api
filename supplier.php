@@ -1,5 +1,6 @@
 <?php
 require 'db_connect.php';
+require_once 'ActivityLogger.php';
 
 // Add CORS headers for API access
 header("Access-Control-Allow-Origin: *");
@@ -23,10 +24,12 @@ class SupplierService {
     private $conn;
     private $pdo;
     private $uploadPath = "uploads/supplier_portal/";
+    private $logger;
 
     public function __construct($pdo) {
         $this->conn = $pdo;
         $this->pdo = $pdo;
+        $this->logger = new ActivityLogger($pdo);
 
         // Ensure upload directories exist
         $this->createUploadDirectories();
@@ -763,6 +766,24 @@ class SupplierService {
             // Log activity
             $this->logSupplierActivity($supplier['supplier_id'], 'offer_created',
                 "Created new offer: " . $data['offer_title'], $offerId);
+
+            // Also log with comprehensive ActivityLogger
+            if ($this->logger) {
+                $this->logger->logSupplier(
+                    $userId,
+                    $supplier['supplier_id'],
+                    'offer_created',
+                    "Supplier created new offer: {$data['offer_title']} (Price range: {$data['price_min']} - {$priceMax})",
+                    [
+                        'offer_id' => $offerId,
+                        'offer_title' => $data['offer_title'],
+                        'price_min' => $data['price_min'],
+                        'price_max' => $priceMax,
+                        'service_category' => $data['service_category'] ?? null,
+                        'max_guests' => $data['max_guests'] ?? null
+                    ]
+                );
+            }
 
             $this->conn->commit();
 
