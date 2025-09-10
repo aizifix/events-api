@@ -94,15 +94,8 @@ class Admin {
                 }
             }
 
-            // Wedding-specific validation
-            if ($data['event_type_id'] == 1) { // Wedding event
-                if (empty($data['church_start_time'])) {
-                    $this->conn->rollback();
-                    error_log("createEvent error: Church start time is required for wedding events");
-                    return json_encode(["status" => "error", "message" => "Church start time is required for wedding events"]);
-                }
-                // Note: church_location is optional even for weddings
-            }
+            // Wedding-specific validation - removed church start time requirement
+            // Note: church_location and church_start_time are now optional for weddings
 
             // Validate foreign key references before insertion
             // Check if user exists
@@ -268,6 +261,49 @@ class Admin {
 
             $eventId = $this->conn->lastInsertId();
             error_log("createEvent: Event created with ID: $eventId");
+
+            // Create organizer assignment record if organizer is specified
+            if (!empty($data['organizer_id'])) {
+                try {
+                    $assignmentSql = "INSERT INTO tbl_event_organizer_assignments (
+                        event_id, organizer_id, assigned_by, status, notes, agreed_talent_fee, fee_currency, fee_status
+                    ) VALUES (
+                        :event_id, :organizer_id, :assigned_by, 'assigned', :notes, :agreed_talent_fee, :fee_currency, :fee_status
+                    )";
+
+                    $assignmentStmt = $this->conn->prepare($assignmentSql);
+                    try {
+                        $assignmentStmt->execute([
+                            ':event_id' => $eventId,
+                            ':organizer_id' => $data['organizer_id'],
+                            ':assigned_by' => $data['admin_id'],
+                            ':notes' => 'Assigned during event creation',
+                            ':agreed_talent_fee' => $data['agreed_talent_fee'] ?? null,
+                            ':fee_currency' => $data['fee_currency'] ?? 'PHP',
+                            ':fee_status' => $data['fee_status'] ?? 'unset'
+                        ]);
+                    } catch (Exception $e2) {
+                        // Fallback if fee columns don't exist yet
+                        $assignmentSql2 = "INSERT INTO tbl_event_organizer_assignments (
+                            event_id, organizer_id, assigned_by, status, notes
+                        ) VALUES (
+                            :event_id, :organizer_id, :assigned_by, 'assigned', :notes
+                        )";
+                        $assignmentStmt2 = $this->conn->prepare($assignmentSql2);
+                        $assignmentStmt2->execute([
+                            ':event_id' => $eventId,
+                            ':organizer_id' => $data['organizer_id'],
+                            ':assigned_by' => $data['admin_id'],
+                            ':notes' => 'Assigned during event creation'
+                        ]);
+                    }
+
+                    error_log("createEvent: Organizer assignment created for organizer ID: " . $data['organizer_id']);
+                } catch (Exception $e) {
+                    error_log("createEvent: Failed to create organizer assignment: " . $e->getMessage());
+                    // Don't fail the entire transaction for assignment creation
+                }
+            }
 
             // Insert event components if provided
             if (!empty($data['components']) && is_array($data['components'])) {
@@ -2986,7 +3022,18 @@ This is an automated message. Please do not reply.
     }
         public function getEventById($eventId) {
         try {
-            $stmt = $this->pdo->prepare("
+            $hasEoaPaymentStatus = false;
+            try {
+                $colStmt = $this->pdo->prepare("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_event_organizer_assignments' AND COLUMN_NAME = 'payment_status' LIMIT 1");
+                $colStmt->execute();
+                $hasEoaPaymentStatus = (bool)$colStmt->fetchColumn();
+            } catch (Exception $e) {
+                $hasEoaPaymentStatus = false;
+            }
+
+            $organizerPaymentSelect = $hasEoaPaymentStatus ? "eoa.payment_status AS organizer_payment_status," : "NULL AS organizer_payment_status,";
+
+            $sql = "
                 SELECT
                     e.*,
                     CONCAT(c.user_firstName, ' ', c.user_lastName) as client_name,
@@ -3000,6 +3047,10 @@ This is an automated message. Please do not reply.
                     c.created_at as client_joined_date,
                     c.user_username as client_username,
                     CONCAT(a.user_firstName, ' ', a.user_lastName) as admin_name,
+                    eoa.organizer_id,
+                    eoa.assignment_id AS organizer_assignment_id,
+                    eoa.status AS assignment_status,
+                    " . $organizerPaymentSelect . "
                     CONCAT(org.user_firstName, ' ', org.user_lastName) as organizer_name,
                     et.event_name as event_type_name,
                     et.event_description as event_type_description,
@@ -3016,14 +3067,17 @@ This is an automated message. Please do not reply.
                 FROM tbl_events e
                 LEFT JOIN tbl_users c ON e.user_id = c.user_id
                 LEFT JOIN tbl_users a ON e.admin_id = a.user_id
-                LEFT JOIN tbl_users org ON e.organizer_id = org.user_id
+                LEFT JOIN tbl_event_organizer_assignments eoa ON e.event_id = eoa.event_id AND eoa.status IN ('assigned','accepted')
+                LEFT JOIN tbl_organizer o ON eoa.organizer_id = o.organizer_id
+                LEFT JOIN tbl_users org ON o.user_id = org.user_id
                 LEFT JOIN tbl_event_type et ON e.event_type_id = et.event_type_id
                 LEFT JOIN tbl_packages p ON e.package_id = p.package_id
                 LEFT JOIN tbl_venue v ON e.venue_id = v.venue_id
                 LEFT JOIN tbl_payment_schedule_types pst ON e.payment_schedule_type_id = pst.schedule_type_id
                 WHERE e.event_id = ?
-            ");
-                        $stmt->execute([$eventId]);
+            ";
+            $stmt = $this->pdo->prepare($sql);
+            $stmt->execute([$eventId]);
             $event = $stmt->fetch(PDO::FETCH_ASSOC);
 
             if ($event) {
@@ -6956,6 +7010,51 @@ This is an automated message. Please do not reply.
         }
     }
 
+    public function updateOrganizerPaymentStatus($data) {
+        try {
+            if (!isset($data['assignment_id']) || !isset($data['payment_status'])) {
+                return json_encode(["status" => "error", "message" => "Assignment ID and payment status are required"]);
+            }
+
+            $validStatuses = ['unpaid','partial','paid','cancelled'];
+            if (!in_array($data['payment_status'], $validStatuses)) {
+                return json_encode(["status" => "error", "message" => "Invalid payment status"]);
+            }
+
+            $stmt = $this->pdo->prepare("UPDATE tbl_event_organizer_assignments SET payment_status = :status, updated_at = CURRENT_TIMESTAMP WHERE assignment_id = :id");
+            $ok = $stmt->execute([':status' => $data['payment_status'], ':id' => $data['assignment_id']]);
+            if ($ok) {
+                return json_encode(["status" => "success", "message" => "Organizer payment status updated"]);
+            }
+            return json_encode(["status" => "error", "message" => "Failed to update organizer payment status"]);
+        } catch (Exception $e) {
+            error_log("updateOrganizerPaymentStatus error: " . $e->getMessage());
+            return json_encode(["status" => "error", "message" => "Database error: " . $e->getMessage()]);
+        }
+    }
+
+    public function updateVenuePaymentStatus($data) {
+        try {
+            if (!isset($data['event_id']) || !isset($data['payment_status'])) {
+                return json_encode(["status" => "error", "message" => "Event ID and payment status are required"]);
+            }
+
+            $validStatuses = ['unpaid','partial','paid','cancelled'];
+            if (!in_array($data['payment_status'], $validStatuses)) {
+                return json_encode(["status" => "error", "message" => "Invalid payment status"]);
+            }
+
+            $stmt = $this->pdo->prepare("UPDATE tbl_events SET venue_payment_status = :status, updated_at = CURRENT_TIMESTAMP WHERE event_id = :event_id");
+            $ok = $stmt->execute([':status' => $data['payment_status'], ':event_id' => $data['event_id']]);
+            if ($ok) {
+                return json_encode(["status" => "success", "message" => "Venue payment status updated"]);
+            }
+            return json_encode(["status" => "error", "message" => "Failed to update venue payment status"]);
+        } catch (Exception $e) {
+            error_log("updateVenuePaymentStatus error: " . $e->getMessage());
+            return json_encode(["status" => "error", "message" => "Database error: " . $e->getMessage()]);
+        }
+    }
     public function updateEventBudget($eventId, $budgetChange) {
         try {
             // Get current budget
@@ -7103,7 +7202,7 @@ This is an automated message. Please do not reply.
     public function updateEventFinalization($eventId, $action) {
         try {
             // Get event details first
-            $eventSql = "SELECT e.*, u.email as client_email, u.first_name, u.last_name
+            $eventSql = "SELECT e.*, u.user_email as client_email, u.user_firstName, u.user_lastName
                         FROM tbl_events e
                         LEFT JOIN tbl_users u ON e.user_id = u.user_id
                         WHERE e.event_id = ?";
@@ -7155,7 +7254,7 @@ This is an automated message. Please do not reply.
                     "finalized_at" => date('Y-m-d H:i:s')
                 ]);
             } else {
-                // Unfinalize the event
+                // Unfinalize the event (set back to planning/draft) without password
                 $updateSql = "UPDATE tbl_events SET
                              event_status = 'draft',
                              finalized_at = NULL,
@@ -7166,7 +7265,7 @@ This is an automated message. Please do not reply.
 
                 return json_encode([
                     "status" => "success",
-                    "message" => "Event has been set back to draft status"
+                    "message" => "Event has been set back to planning status"
                 ]);
             }
         } catch (PDOException $e) {
@@ -7403,22 +7502,56 @@ This is an automated message. Please do not reply.
                 $experienceSummary .= "\nAddress: " . $data['address'];
             }
 
+            // Validate talent fee values (server-side)
+            if ((isset($data['talent_fee_min']) && $data['talent_fee_min'] !== null && $data['talent_fee_min'] !== '' && floatval($data['talent_fee_min']) < 0)
+                || (isset($data['talent_fee_max']) && $data['talent_fee_max'] !== null && $data['talent_fee_max'] !== '' && floatval($data['talent_fee_max']) < 0)) {
+                throw new Exception("Talent fees cannot be negative");
+            }
+            if ((isset($data['talent_fee_min']) && $data['talent_fee_min'] !== '' && $data['talent_fee_min'] !== null)
+                && (isset($data['talent_fee_max']) && $data['talent_fee_max'] !== '' && $data['talent_fee_max'] !== null)
+                && floatval($data['talent_fee_min']) > floatval($data['talent_fee_max'])) {
+                throw new Exception("Minimum talent fee cannot be greater than maximum talent fee");
+            }
+
             // Create organizer record (using actual database column names)
             $organizerSql = "INSERT INTO tbl_organizer (
                                 user_id, organizer_experience, organizer_certifications,
                                 organizer_resume_path, organizer_portfolio_link,
+                                talent_fee_min, talent_fee_max, talent_fee_currency, talent_fee_notes,
                                 organizer_availability, remarks, created_at
-                            ) VALUES (?, ?, ?, ?, ?, 'flexible', ?, NOW())";
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'flexible', ?, NOW())";
 
-            $organizerStmt = $this->conn->prepare($organizerSql);
-            $organizerStmt->execute([
-                $userId,
-                $experienceSummary,
-                $certificationFilesJson,
-                $resumePath,
-                $data['portfolio_link'] ?? null,
-                $data['admin_remarks'] ?? null
-            ]);
+            try {
+                $organizerStmt = $this->conn->prepare($organizerSql);
+                $organizerStmt->execute([
+                    $userId,
+                    $experienceSummary,
+                    $certificationFilesJson,
+                    $resumePath,
+                    $data['portfolio_link'] ?? null,
+                    $data['talent_fee_min'] ?? null,
+                    $data['talent_fee_max'] ?? null,
+                    $data['talent_fee_currency'] ?? 'PHP',
+                    $data['talent_fee_notes'] ?? null,
+                    $data['admin_remarks'] ?? null
+                ]);
+            } catch (Exception $e) {
+                // Fallback for databases that haven't run the talent fee migration
+                $fallbackSql = "INSERT INTO tbl_organizer (
+                                    user_id, organizer_experience, organizer_certifications,
+                                    organizer_resume_path, organizer_portfolio_link,
+                                    organizer_availability, remarks, created_at
+                                ) VALUES (?, ?, ?, ?, ?, 'flexible', ?, NOW())";
+                $fallbackStmt = $this->conn->prepare($fallbackSql);
+                $fallbackStmt->execute([
+                    $userId,
+                    $experienceSummary,
+                    $certificationFilesJson,
+                    $resumePath,
+                    $data['portfolio_link'] ?? null,
+                    $data['admin_remarks'] ?? null
+                ]);
+            }
 
             $organizerId = $this->conn->lastInsertId();
 
@@ -7477,6 +7610,259 @@ This is an automated message. Please do not reply.
         }
     }
 
+    // =============================================================================
+    // STAFF MANAGEMENT METHODS
+    // =============================================================================
+
+    public function createStaff($data) {
+        try {
+            $this->conn->beginTransaction();
+
+            // Validate required fields
+            $required = ['first_name', 'last_name', 'email', 'phone', 'username', 'password'];
+            foreach ($required as $field) {
+                if (empty($data[$field])) {
+                    throw new Exception("$field is required");
+                }
+            }
+
+            // Validate email format
+            if (!filter_var($data['email'], FILTER_VALIDATE_EMAIL)) {
+                throw new Exception("Invalid email format");
+            }
+
+            // Check for duplicate email or username
+            $checkStmt = $this->conn->prepare("SELECT user_id FROM tbl_users WHERE user_email = ? OR user_username = ?");
+            $checkStmt->execute([$data['email'], $data['username']]);
+            if ($checkStmt->fetch(PDO::FETCH_ASSOC)) {
+                throw new Exception("An account with this email or username already exists");
+            }
+
+            // Hash password
+            $hashedPassword = password_hash($data['password'], PASSWORD_DEFAULT);
+
+            // Profile picture path (optional)
+            $profilePicturePath = !empty($data['profile_picture']) ? $data['profile_picture'] : null;
+
+            // Create user account as staff
+            $userSql = "INSERT INTO tbl_users (
+                           user_firstName, user_lastName, user_suffix, user_birthdate,
+                           user_email, user_contact, user_username, user_pwd,
+                           user_role, user_pfp, account_status, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'staff', ?, 'active', NOW())";
+
+            $userStmt = $this->conn->prepare($userSql);
+            $userStmt->execute([
+                $data['first_name'],
+                $data['last_name'],
+                $data['suffix'] ?? null,
+                $data['date_of_birth'] ?? null,
+                $data['email'],
+                $data['phone'],
+                $data['username'],
+                $hashedPassword,
+                $profilePicturePath
+            ]);
+
+            $userId = $this->conn->lastInsertId();
+
+            // Insert staff profile
+            $staffSql = "INSERT INTO tbl_staff (
+                            user_id, role_title, branch_name, can_handle_bookings, remarks, created_at
+                         ) VALUES (?, ?, ?, ?, ?, NOW())";
+            $staffStmt = $this->conn->prepare($staffSql);
+            $staffStmt->execute([
+                $userId,
+                $data['role_title'] ?? 'head_organizer',
+                $data['branch_name'] ?? null,
+                !empty($data['can_handle_bookings']) ? 1 : 0,
+                $data['admin_remarks'] ?? null
+            ]);
+
+            $staffId = $this->conn->lastInsertId();
+
+            $this->conn->commit();
+
+            return json_encode([
+                "status" => "success",
+                "message" => "Staff created successfully",
+                "data" => [
+                    "staff_id" => $staffId,
+                    "user_id" => $userId,
+                    "email" => $data['email'],
+                    "username" => $data['username']
+                ]
+            ]);
+        } catch (Exception $e) {
+            if ($this->conn->inTransaction()) {
+                $this->conn->rollBack();
+            }
+            return json_encode(["status" => "error", "message" => "Error creating staff: " . $e->getMessage()]);
+        }
+    }
+
+    public function getAllStaff($page = 1, $limit = 20, $filters = []) {
+        try {
+            $offset = ($page - 1) * $limit;
+            $conditions = ["u.user_role = 'staff'"];
+            $params = [];
+
+            if (!empty($filters['search'])) {
+                $conditions[] = "(u.user_firstName LIKE ? OR u.user_lastName LIKE ? OR u.user_email LIKE ? OR u.user_username LIKE ?)";
+                $searchTerm = '%' . $filters['search'] . '%';
+                $params[] = $searchTerm;
+                $params[] = $searchTerm;
+                $params[] = $searchTerm;
+                $params[] = $searchTerm;
+            }
+
+            if (!empty($filters['status'])) {
+                $conditions[] = "u.account_status = ?";
+                $params[] = $filters['status'] === 'active' ? 'active' : 'inactive';
+            }
+
+            if (!empty($filters['role'])) {
+                $conditions[] = "s.role_title = ?";
+                $params[] = $filters['role'];
+            }
+
+            $where = implode(' AND ', $conditions);
+
+            // Count
+            $countSql = "SELECT COUNT(*)
+                        FROM tbl_users u
+                        LEFT JOIN tbl_staff s ON u.user_id = s.user_id
+                        WHERE $where";
+            $countStmt = $this->conn->prepare($countSql);
+            $countStmt->execute($params);
+            $total = (int)$countStmt->fetchColumn();
+
+            // Data
+            $sql = "SELECT
+                        u.user_id, u.user_firstName, u.user_lastName, u.user_email, u.user_contact,
+                        u.user_username, u.user_pfp, u.account_status, u.created_at,
+                        s.staff_id, s.role_title, s.branch_name, s.can_handle_bookings
+                    FROM tbl_users u
+                    LEFT JOIN tbl_staff s ON u.user_id = s.user_id
+                    WHERE $where
+                    ORDER BY u.created_at DESC
+                    LIMIT ? OFFSET ?";
+            $paramsData = array_merge($params, [$limit, $offset]);
+            $stmt = $this->conn->prepare($sql);
+            $stmt->execute($paramsData);
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            $staff = array_map(function ($r) {
+                return [
+                    'staff_id' => $r['staff_id'],
+                    'user_id' => $r['user_id'],
+                    'first_name' => $r['user_firstName'],
+                    'last_name' => $r['user_lastName'],
+                    'email' => $r['user_email'],
+                    'contact_number' => $r['user_contact'],
+                    'username' => $r['user_username'],
+                    'profile_picture' => $r['user_pfp'],
+                    'branch_name' => $r['branch_name'],
+                    'role_title' => $r['role_title'] ?? 'head_organizer',
+                    'can_handle_bookings' => (bool)$r['can_handle_bookings'],
+                    'is_active' => $r['account_status'] === 'active',
+                    'created_at' => $r['created_at']
+                ];
+            }, $rows);
+
+            return json_encode([
+                'status' => 'success',
+                'data' => [
+                    'staff' => $staff,
+                    'pagination' => [
+                        'current_page' => $page,
+                        'total_pages' => max(1, (int)ceil($total / $limit)),
+                        'total_count' => $total,
+                        'per_page' => $limit
+                    ]
+                ]
+            ]);
+        } catch (Exception $e) {
+            return json_encode(['status' => 'error', 'message' => 'Error fetching staff: ' . $e->getMessage()]);
+        }
+    }
+
+    public function updateStaff($staffId, $data) {
+        try {
+            $this->conn->beginTransaction();
+
+            // Find user_id
+            $q = $this->conn->prepare("SELECT user_id FROM tbl_staff WHERE staff_id = ?");
+            $q->execute([$staffId]);
+            $row = $q->fetch(PDO::FETCH_ASSOC);
+            if (!$row) {
+                throw new Exception('Staff not found');
+            }
+            $userId = (int)$row['user_id'];
+
+            // Update user fields if provided
+            $userFields = [];
+            $userParams = [];
+            if (isset($data['first_name'])) { $userFields[] = 'user_firstName = ?'; $userParams[] = $data['first_name']; }
+            if (isset($data['last_name'])) { $userFields[] = 'user_lastName = ?'; $userParams[] = $data['last_name']; }
+            if (isset($data['email'])) { $userFields[] = 'user_email = ?'; $userParams[] = $data['email']; }
+            if (isset($data['contact_number'])) { $userFields[] = 'user_contact = ?'; $userParams[] = $data['contact_number']; }
+            if (isset($data['username'])) { $userFields[] = 'user_username = ?'; $userParams[] = $data['username']; }
+            if (!empty($data['profile_picture'])) { $userFields[] = 'user_pfp = ?'; $userParams[] = $data['profile_picture']; }
+
+            if (!empty($userFields)) {
+                $userParams[] = $userId;
+                $sql = 'UPDATE tbl_users SET ' . implode(', ', $userFields) . ' WHERE user_id = ?';
+                $stmt = $this->conn->prepare($sql);
+                $stmt->execute($userParams);
+            }
+
+            // Update staff profile
+            $staffFields = [];
+            $staffParams = [];
+            if (isset($data['role_title'])) { $staffFields[] = 'role_title = ?'; $staffParams[] = $data['role_title']; }
+            if (array_key_exists('branch_name', $data)) { $staffFields[] = 'branch_name = ?'; $staffParams[] = $data['branch_name']; }
+            if (isset($data['can_handle_bookings'])) { $staffFields[] = 'can_handle_bookings = ?'; $staffParams[] = !empty($data['can_handle_bookings']) ? 1 : 0; }
+            if (array_key_exists('admin_remarks', $data)) { $staffFields[] = 'remarks = ?'; $staffParams[] = $data['admin_remarks']; }
+
+            if (!empty($staffFields)) {
+                $staffParams[] = $staffId;
+                $sql = 'UPDATE tbl_staff SET ' . implode(', ', $staffFields) . ' WHERE staff_id = ?';
+                $stmt = $this->conn->prepare($sql);
+                $stmt->execute($staffParams);
+            }
+
+            $this->conn->commit();
+            return json_encode(['status' => 'success', 'message' => 'Staff updated successfully']);
+        } catch (Exception $e) {
+            $this->conn->rollBack();
+            return json_encode(['status' => 'error', 'message' => 'Error updating staff: ' . $e->getMessage()]);
+        }
+    }
+
+    public function deleteStaff($staffId) {
+        try {
+            $this->conn->beginTransaction();
+            $q = $this->conn->prepare('SELECT user_id FROM tbl_staff WHERE staff_id = ?');
+            $q->execute([$staffId]);
+            $row = $q->fetch(PDO::FETCH_ASSOC);
+            if (!$row) {
+                throw new Exception('Staff not found');
+            }
+            $userId = (int)$row['user_id'];
+
+            // Soft deactivate user
+            $u = $this->conn->prepare("UPDATE tbl_users SET account_status = 'inactive' WHERE user_id = ?");
+            $u->execute([$userId]);
+
+            $this->conn->commit();
+            return json_encode(['status' => 'success', 'message' => 'Staff deactivated successfully']);
+        } catch (Exception $e) {
+            $this->conn->rollBack();
+            return json_encode(['status' => 'error', 'message' => 'Error deactivating staff: ' . $e->getMessage()]);
+        }
+    }
+
     public function getAllOrganizers($page = 1, $limit = 20, $filters = []) {
         try {
             $offset = ($page - 1) * $limit;
@@ -7519,6 +7905,7 @@ This is an automated message. Please do not reply.
                         u.user_pfp, u.account_status, u.created_at,
                         o.organizer_id, o.organizer_experience, o.organizer_certifications,
                         o.organizer_resume_path, o.organizer_portfolio_link,
+                        o.talent_fee_min, o.talent_fee_max, o.talent_fee_currency, o.talent_fee_notes,
                         o.organizer_availability, o.remarks
                     FROM tbl_users u
                     LEFT JOIN tbl_organizer o ON u.user_id = o.user_id
@@ -7551,6 +7938,10 @@ This is an automated message. Please do not reply.
                     'certifications' => $organizer['organizer_certifications'],
                     'resume_path' => $organizer['organizer_resume_path'],
                     'portfolio_link' => $organizer['organizer_portfolio_link'],
+                    'talent_fee_min' => isset($organizer['talent_fee_min']) ? (float)$organizer['talent_fee_min'] : null,
+                    'talent_fee_max' => isset($organizer['talent_fee_max']) ? (float)$organizer['talent_fee_max'] : null,
+                    'talent_fee_currency' => $organizer['talent_fee_currency'] ?? 'PHP',
+                    'talent_fee_notes' => $organizer['talent_fee_notes'] ?? null,
                     'availability' => $organizer['organizer_availability'],
                     'remarks' => $organizer['remarks'],
                     'created_at' => $organizer['created_at']
@@ -7583,6 +7974,7 @@ This is an automated message. Please do not reply.
                         u.user_pfp, u.account_status, u.created_at,
                         o.organizer_id, o.organizer_experience, o.organizer_certifications,
                         o.organizer_resume_path, o.organizer_portfolio_link,
+                        o.talent_fee_min, o.talent_fee_max, o.talent_fee_currency, o.talent_fee_notes,
                         o.organizer_availability, o.remarks
                     FROM tbl_users u
                     INNER JOIN tbl_organizer o ON u.user_id = o.user_id
@@ -7612,6 +8004,10 @@ This is an automated message. Please do not reply.
                 'certifications' => $organizer['organizer_certifications'],
                 'resume_path' => $organizer['organizer_resume_path'],
                 'portfolio_link' => $organizer['organizer_portfolio_link'],
+                'talent_fee_min' => isset($organizer['talent_fee_min']) ? (float)$organizer['talent_fee_min'] : null,
+                'talent_fee_max' => isset($organizer['talent_fee_max']) ? (float)$organizer['talent_fee_max'] : null,
+                'talent_fee_currency' => $organizer['talent_fee_currency'] ?? 'PHP',
+                'talent_fee_notes' => $organizer['talent_fee_notes'] ?? null,
                 'availability' => $organizer['organizer_availability'],
                 'remarks' => $organizer['remarks'],
                 'created_at' => $organizer['created_at']
@@ -7680,6 +8076,17 @@ This is an automated message. Please do not reply.
                 }
             }
 
+            // Validate talent fee values (server-side)
+            if ((isset($data['talent_fee_min']) && $data['talent_fee_min'] !== null && $data['talent_fee_min'] !== '' && floatval($data['talent_fee_min']) < 0)
+                || (isset($data['talent_fee_max']) && $data['talent_fee_max'] !== null && $data['talent_fee_max'] !== '' && floatval($data['talent_fee_max']) < 0)) {
+                throw new Exception("Talent fees cannot be negative");
+            }
+            if ((isset($data['talent_fee_min']) && $data['talent_fee_min'] !== '' && $data['talent_fee_min'] !== null)
+                && (isset($data['talent_fee_max']) && $data['talent_fee_max'] !== '' && $data['talent_fee_max'] !== null)
+                && floatval($data['talent_fee_min']) > floatval($data['talent_fee_max'])) {
+                throw new Exception("Minimum talent fee cannot be greater than maximum talent fee");
+            }
+
             // Update organizer data
             $organizerFields = [];
             $organizerParams = [];
@@ -7695,6 +8102,22 @@ This is an automated message. Please do not reply.
             if (isset($data['portfolio_link'])) {
                 $organizerFields[] = "organizer_portfolio_link = ?";
                 $organizerParams[] = $data['portfolio_link'];
+            }
+            if (array_key_exists('talent_fee_min', $data)) {
+                $organizerFields[] = "talent_fee_min = ?";
+                $organizerParams[] = $data['talent_fee_min'] !== '' ? $data['talent_fee_min'] : null;
+            }
+            if (array_key_exists('talent_fee_max', $data)) {
+                $organizerFields[] = "talent_fee_max = ?";
+                $organizerParams[] = $data['talent_fee_max'] !== '' ? $data['talent_fee_max'] : null;
+            }
+            if (isset($data['talent_fee_currency'])) {
+                $organizerFields[] = "talent_fee_currency = ?";
+                $organizerParams[] = $data['talent_fee_currency'] ?: 'PHP';
+            }
+            if (array_key_exists('talent_fee_notes', $data)) {
+                $organizerFields[] = "talent_fee_notes = ?";
+                $organizerParams[] = $data['talent_fee_notes'];
             }
             if (isset($data['availability'])) {
                 $organizerFields[] = "organizer_availability = ?";
@@ -7714,9 +8137,46 @@ This is an automated message. Please do not reply.
 
             if (!empty($organizerFields)) {
                 $organizerParams[] = $organizerId;
-                $organizerSql = "UPDATE tbl_organizer SET " . implode(', ', $organizerFields) . " WHERE organizer_id = ?";
-                $organizerStmt = $this->conn->prepare($organizerSql);
-                $organizerStmt->execute($organizerParams);
+                try {
+                    $organizerSql = "UPDATE tbl_organizer SET " . implode(', ', $organizerFields) . " WHERE organizer_id = ?";
+                    $organizerStmt = $this->conn->prepare($organizerSql);
+                    $organizerStmt->execute($organizerParams);
+                } catch (Exception $e) {
+                    // Rebuild update excluding fee fields (for DBs without migration)
+                    $fieldsNoFee = [];
+                    $paramsNoFee = [];
+                    if (isset($data['experience_summary'])) {
+                        $fieldsNoFee[] = "organizer_experience = ?";
+                        $paramsNoFee[] = $data['experience_summary'];
+                    }
+                    if (isset($data['certifications'])) {
+                        $fieldsNoFee[] = "organizer_certifications = ?";
+                        $paramsNoFee[] = $data['certifications'];
+                    }
+                    if (isset($data['portfolio_link'])) {
+                        $fieldsNoFee[] = "organizer_portfolio_link = ?";
+                        $paramsNoFee[] = $data['portfolio_link'];
+                    }
+                    if (isset($data['availability'])) {
+                        $fieldsNoFee[] = "organizer_availability = ?";
+                        $paramsNoFee[] = $data['availability'];
+                    }
+                    if (isset($data['remarks'])) {
+                        $fieldsNoFee[] = "remarks = ?";
+                        $paramsNoFee[] = $data['remarks'];
+                    }
+                    // Include resume path if it was uploaded this request
+                    if (isset($resumePath)) {
+                        $fieldsNoFee[] = "organizer_resume_path = ?";
+                        $paramsNoFee[] = $resumePath;
+                    }
+                    if (!empty($fieldsNoFee)) {
+                        $paramsNoFee[] = $organizerId;
+                        $sqlNoFee = "UPDATE tbl_organizer SET " . implode(', ', $fieldsNoFee) . " WHERE organizer_id = ?";
+                        $stmtNoFee = $this->conn->prepare($sqlNoFee);
+                        $stmtNoFee->execute($paramsNoFee);
+                    }
+                }
             }
 
             // Log activity
@@ -8842,6 +9302,183 @@ Event Coordination System Team
         }
     }
 
+    // Organizer Assignment Methods
+    public function assignOrganizerToEvent($data) {
+        try {
+            $eventId = (int)($data['event_id'] ?? 0);
+            $organizerId = (int)($data['organizer_id'] ?? 0);
+            $assignedBy = (int)($data['assigned_by'] ?? 0);
+            $notes = $data['notes'] ?? null;
+
+            if ($eventId <= 0) {
+                return json_encode(["status" => "error", "message" => "Valid event ID required"]);
+            }
+
+            if ($organizerId <= 0) {
+                return json_encode(["status" => "error", "message" => "Valid organizer ID required"]);
+            }
+
+            if ($assignedBy <= 0) {
+                return json_encode(["status" => "error", "message" => "Valid admin ID required"]);
+            }
+
+            // Call the stored procedure to assign organizer
+            $stmt = $this->conn->prepare("CALL AssignOrganizerToEvent(?, ?, ?, ?)");
+            $stmt->execute([$eventId, $organizerId, $assignedBy, $notes]);
+
+            // Log the activity
+            $this->logActivity($assignedBy, 'organizer_assigned', "Assigned organizer ID $organizerId to event ID $eventId", 'admin');
+
+            return json_encode([
+                "status" => "success",
+                "message" => "Organizer assigned successfully",
+                "data" => [
+                    "event_id" => $eventId,
+                    "organizer_id" => $organizerId,
+                    "assigned_by" => $assignedBy
+                ]
+            ]);
+
+        } catch (Exception $e) {
+            error_log("assignOrganizerToEvent error: " . $e->getMessage());
+            return json_encode(["status" => "error", "message" => "Failed to assign organizer: " . $e->getMessage()]);
+        }
+    }
+
+    public function getEventOrganizerDetails($eventId) {
+        try {
+            $eventId = (int)$eventId;
+            if ($eventId <= 0) {
+                return json_encode(["status" => "error", "message" => "Valid event ID required"]);
+            }
+            $result = null;
+            try {
+                $stmt = $this->conn->prepare("CALL GetEventOrganizerDetails(?)");
+                $stmt->execute([$eventId]);
+                $result = $stmt->fetch(PDO::FETCH_ASSOC);
+                // If procedure filters only 'assigned', fallback to accepted as well
+                if (!$result) {
+                    throw new Exception('Procedure returned no rows');
+                }
+            } catch (Exception $e) {
+                error_log("GetEventOrganizerDetails procedure failed, using direct query: " . $e->getMessage());
+                // Fallback to direct query using correct user field names
+                $sql = "
+                    SELECT
+                        e.event_id,
+                        e.event_title,
+                        e.organizer_id,
+                        o.organizer_id as organizer_organizer_id,
+                        CONCAT(u.user_firstName, ' ', u.user_lastName) as organizer_name,
+                        u.user_email as organizer_email,
+                        u.user_contact as organizer_phone,
+                        o.organizer_experience,
+                        o.organizer_certifications,
+                        o.organizer_availability,
+                        eoa.assignment_id AS organizer_assignment_id,
+                        eoa.assigned_by,
+                        CONCAT(admin.user_firstName, ' ', admin.user_lastName) as assigned_by_name,
+                        eoa.assigned_at,
+                        eoa.status as assignment_status,
+                        eoa.notes as assignment_notes
+                    FROM tbl_events e
+                    LEFT JOIN tbl_event_organizer_assignments eoa ON e.event_id = eoa.event_id AND eoa.status IN ('assigned','accepted')
+                    LEFT JOIN tbl_organizer o ON eoa.organizer_id = o.organizer_id
+                    LEFT JOIN tbl_users u ON o.user_id = u.user_id
+                    LEFT JOIN tbl_users admin ON eoa.assigned_by = admin.user_id
+                    WHERE e.event_id = ?
+                ";
+                $fallback = $this->conn->prepare($sql);
+                $fallback->execute([$eventId]);
+                $result = $fallback->fetch(PDO::FETCH_ASSOC);
+            }
+
+            if (!$result) {
+                return json_encode([
+                    "status" => "success",
+                    "data" => null,
+                    "message" => "No organizer assigned to this event"
+                ]);
+            }
+            // Ensure consistent key name expected by frontend
+            if (!isset($result['organizer_assignment_id']) && isset($result['assignment_id'])) {
+                $result['organizer_assignment_id'] = $result['assignment_id'];
+            }
+
+            return json_encode([
+                "status" => "success",
+                "data" => $result
+            ]);
+
+        } catch (Exception $e) {
+            error_log("getEventOrganizerDetails error: " . $e->getMessage());
+            return json_encode(["status" => "error", "message" => "Failed to get organizer details: " . $e->getMessage()]);
+        }
+    }
+
+    public function getOrganizerEvents($organizerId) {
+        try {
+            $organizerId = (int)$organizerId;
+            if ($organizerId <= 0) {
+                return json_encode(["status" => "error", "message" => "Valid organizer ID required"]);
+            }
+
+            $stmt = $this->conn->prepare("CALL GetOrganizerEvents(?)");
+            $stmt->execute([$organizerId]);
+            $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            return json_encode([
+                "status" => "success",
+                "data" => $results
+            ]);
+
+        } catch (Exception $e) {
+            error_log("getOrganizerEvents error: " . $e->getMessage());
+            return json_encode(["status" => "error", "message" => "Failed to get organizer events: " . $e->getMessage()]);
+        }
+    }
+
+    public function updateOrganizerAssignmentStatus($data) {
+        try {
+            $assignmentId = (int)($data['assignment_id'] ?? 0);
+            $status = $data['status'] ?? '';
+            $updatedBy = (int)($data['updated_by'] ?? 0);
+
+            if ($assignmentId <= 0) {
+                return json_encode(["status" => "error", "message" => "Valid assignment ID required"]);
+            }
+
+            if (!in_array($status, ['assigned', 'accepted', 'rejected', 'removed'])) {
+                return json_encode(["status" => "error", "message" => "Invalid status"]);
+            }
+
+            if ($updatedBy <= 0) {
+                return json_encode(["status" => "error", "message" => "Valid user ID required"]);
+            }
+
+            // Call the stored procedure to update status
+            $stmt = $this->conn->prepare("CALL UpdateOrganizerAssignmentStatus(?, ?, ?)");
+            $stmt->execute([$assignmentId, $status, $updatedBy]);
+
+            // Log the activity
+            $this->logActivity($updatedBy, 'organizer_assignment_updated', "Updated organizer assignment ID $assignmentId to status $status", 'admin');
+
+            return json_encode([
+                "status" => "success",
+                "message" => "Organizer assignment status updated successfully",
+                "data" => [
+                    "assignment_id" => $assignmentId,
+                    "status" => $status,
+                    "updated_by" => $updatedBy
+                ]
+            ]);
+
+        } catch (Exception $e) {
+            error_log("updateOrganizerAssignmentStatus error: " . $e->getMessage());
+            return json_encode(["status" => "error", "message" => "Failed to update assignment status: " . $e->getMessage()]);
+        }
+    }
+
     // Ensure user activity logs table exists
     private function ensureUserActivityTable() {
         try {
@@ -9334,6 +9971,12 @@ try {
     case "updateComponentPaymentStatus":
         echo $admin->updateComponentPaymentStatus($data);
         break;
+    case "updateOrganizerPaymentStatus":
+        echo $admin->updateOrganizerPaymentStatus($data);
+        break;
+    case "updateVenuePaymentStatus":
+        echo $admin->updateVenuePaymentStatus($data);
+        break;
     case "getEventPaymentStats":
         $eventId = $_GET['event_id'] ?? ($data['event_id'] ?? 0);
         echo $admin->getEventPaymentStats($eventId);
@@ -9560,6 +10203,61 @@ try {
             echo json_encode(["status" => "error", "message" => "Valid organizer ID required"]);
         } else {
             echo $admin->deleteOrganizer($organizerId);
+        }
+        break;
+
+    // Organizer Assignment Operations
+    case "assignOrganizerToEvent":
+        echo $admin->assignOrganizerToEvent($data);
+        break;
+    case "getEventOrganizerDetails":
+        $eventId = (int)($_GET['event_id'] ?? ($data['event_id'] ?? 0));
+        if ($eventId <= 0) {
+            echo json_encode(["status" => "error", "message" => "Valid event ID required"]);
+        } else {
+            echo $admin->getEventOrganizerDetails($eventId);
+        }
+        break;
+    case "getOrganizerEvents":
+        $organizerId = (int)($_GET['organizer_id'] ?? ($data['organizer_id'] ?? 0));
+        if ($organizerId <= 0) {
+            echo json_encode(["status" => "error", "message" => "Valid organizer ID required"]);
+        } else {
+            echo $admin->getOrganizerEvents($organizerId);
+        }
+        break;
+    case "updateOrganizerAssignmentStatus":
+        echo $admin->updateOrganizerAssignmentStatus($data);
+        break;
+
+    // Staff Management
+    case "createStaff":
+        echo $admin->createStaff($data);
+        break;
+    case "getAllStaff":
+        $page = (int)($_GET['page'] ?? 1);
+        $limit = (int)($_GET['limit'] ?? 20);
+        $filters = [
+            'search' => $_GET['search'] ?? '',
+            'status' => $_GET['status'] ?? '',
+            'role' => $_GET['role'] ?? ''
+        ];
+        echo $admin->getAllStaff($page, $limit, $filters);
+        break;
+    case "updateStaff":
+        $staffId = (int)($_GET['staff_id'] ?? ($data['staff_id'] ?? 0));
+        if ($staffId <= 0) {
+            echo json_encode(["status" => "error", "message" => "Valid staff ID required"]);
+        } else {
+            echo $admin->updateStaff($staffId, $data);
+        }
+        break;
+    case "deleteStaff":
+        $staffId = (int)($_GET['staff_id'] ?? ($data['staff_id'] ?? 0));
+        if ($staffId <= 0) {
+            echo json_encode(["status" => "error", "message" => "Valid staff ID required"]);
+        } else {
+            echo $admin->deleteStaff($staffId);
         }
         break;
 

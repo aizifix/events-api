@@ -673,6 +673,168 @@ function getClientEvents($userId) {
     }
 }
 
+// Function to get inclusions/components for a client's specific event (read-only)
+function getClientEventInclusions($userId, $eventId) {
+    global $pdo;
+
+    try {
+        // Verify the event belongs to the client
+        $verifySql = "SELECT COUNT(*) FROM tbl_events WHERE event_id = :event_id AND user_id = :user_id";
+        $verifyStmt = $pdo->prepare($verifySql);
+        $verifyStmt->bindParam(':event_id', $eventId, PDO::PARAM_INT);
+        $verifyStmt->bindParam(':user_id', $userId, PDO::PARAM_INT);
+        $verifyStmt->execute();
+
+        if ($verifyStmt->fetchColumn() == 0) {
+            return [
+                "status" => "error",
+                "message" => "Event not found or access denied"
+            ];
+        }
+
+        // Fetch event components/inclusions in display order
+        $sql = "SELECT
+                    ec.component_id,
+                    ec.event_id,
+                    ec.component_name,
+                    ec.component_price,
+                    ec.component_description,
+                    ec.is_custom,
+                    ec.is_included,
+                    ec.original_package_component_id,
+                    ec.display_order,
+                    ec.payment_status,
+                    ec.payment_date,
+                    ec.payment_notes,
+                    pc.component_name AS original_component_name,
+                    pc.component_description AS original_component_description
+                FROM tbl_event_components ec
+                LEFT JOIN tbl_package_components pc ON ec.original_package_component_id = pc.component_id
+                WHERE ec.event_id = :event_id
+                ORDER BY ec.display_order ASC, ec.component_id ASC";
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->bindParam(':event_id', $eventId, PDO::PARAM_INT);
+        $stmt->execute();
+        $components = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        return [
+            "status" => "success",
+            "components" => $components
+        ];
+    } catch (PDOException $e) {
+        return [
+            "status" => "error",
+            "message" => "Database error: " . $e->getMessage()
+        ];
+    }
+}
+
+// Function to get comprehensive client event details (read-only)
+function getClientEventDetails($userId, $eventId) {
+    global $pdo;
+
+    try {
+        // Verify event belongs to client
+        $verifySql = "SELECT COUNT(*) FROM tbl_events WHERE event_id = :event_id AND user_id = :user_id";
+        $verifyStmt = $pdo->prepare($verifySql);
+        $verifyStmt->bindParam(':event_id', $eventId, PDO::PARAM_INT);
+        $verifyStmt->bindParam(':user_id', $userId, PDO::PARAM_INT);
+        $verifyStmt->execute();
+        if ($verifyStmt->fetchColumn() == 0) {
+            return ["status" => "error", "message" => "Event not found or access denied"];
+        }
+
+        // Base event details (admin enhanced style but scoped to client)
+        $stmt = $pdo->prepare("
+            SELECT
+                e.*,
+                CONCAT(u.user_firstName, ' ', u.user_lastName) as client_name,
+                u.user_pfp as client_pfp,
+                et.event_name as event_type_name,
+                p.package_title,
+                p.package_description,
+                v.venue_title,
+                v.venue_location,
+                v.venue_contact,
+                v.venue_capacity,
+                v.venue_price,
+                CONCAT(a.user_firstName, ' ', a.user_lastName) as admin_name,
+                CONCAT(org.user_firstName, ' ', org.user_lastName) as organizer_name
+            FROM tbl_events e
+            LEFT JOIN tbl_users u ON e.user_id = u.user_id
+            LEFT JOIN tbl_users a ON e.admin_id = a.user_id
+            LEFT JOIN tbl_users org ON e.organizer_id = org.user_id
+            LEFT JOIN tbl_event_type et ON e.event_type_id = et.event_type_id
+            LEFT JOIN tbl_packages p ON e.package_id = p.package_id
+            LEFT JOIN tbl_venue v ON e.venue_id = v.venue_id
+            WHERE e.event_id = ? AND e.user_id = ?
+        ");
+        $stmt->execute([$eventId, $userId]);
+        $event = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$event) {
+            return ["status" => "error", "message" => "Event not found"];
+        }
+
+        // Components/inclusions
+        $stmt = $pdo->prepare("
+            SELECT
+                ec.*,
+                pc.component_name as original_component_name,
+                pc.component_description as original_component_description
+            FROM tbl_event_components ec
+            LEFT JOIN tbl_package_components pc ON ec.original_package_component_id = pc.component_id
+            WHERE ec.event_id = ?
+            ORDER BY ec.display_order
+        ");
+        $stmt->execute([$eventId]);
+        $event['components'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Timeline
+        $stmt = $pdo->prepare("
+            SELECT et.*
+            FROM tbl_event_timeline et
+            WHERE et.event_id = ?
+            ORDER BY et.display_order
+        ");
+        $stmt->execute([$eventId]);
+        $event['timeline'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Payment schedule
+        $stmt = $pdo->prepare("
+            SELECT * FROM tbl_event_payment_schedules
+            WHERE event_id = ?
+            ORDER BY installment_number
+        ");
+        $stmt->execute([$eventId]);
+        $event['payment_schedule'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Payments (exclude cancelled)
+        $stmt = $pdo->prepare("
+            SELECT p.*
+            FROM tbl_payments p
+            WHERE p.event_id = ? AND p.payment_status != 'cancelled'
+            ORDER BY p.payment_date DESC
+        ");
+        $stmt->execute([$eventId]);
+        $event['payments'] = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Parse JSON fields if present
+        if (!empty($event['event_attachments'])) {
+            $decoded = json_decode($event['event_attachments'], true);
+            $event['event_attachments'] = is_array($decoded) ? $decoded : [];
+        }
+        if (!empty($event['recurrence_rule'])) {
+            $decoded = json_decode($event['recurrence_rule'], true);
+            $event['recurrence_rule'] = is_array($decoded) ? $decoded : null;
+        }
+
+        return ["status" => "success", "event" => $event];
+    } catch (Exception $e) {
+        return ["status" => "error", "message" => "Failed to fetch event details: " . $e->getMessage()];
+    }
+}
+
 // Function to get client's payment history
 function getClientPaymentHistory($userId) {
     global $pdo;
@@ -1384,6 +1546,36 @@ switch ($method) {
                     echo json_encode([
                         "status" => "error",
                         "message" => "User ID is required"
+                    ]);
+                }
+                break;
+
+            case 'getClientEventDetails':
+            case 'event-details':
+                $userId = isset($_GET['user_id']) ? intval($_GET['user_id']) : 0;
+                $eventId = isset($_GET['event_id']) ? intval($_GET['event_id']) : 0;
+
+                if ($userId > 0 && $eventId > 0) {
+                    echo json_encode(getClientEventDetails($userId, $eventId));
+                } else {
+                    echo json_encode([
+                        "status" => "error",
+                        "message" => "User ID and Event ID are required"
+                    ]);
+                }
+                break;
+
+            case 'getClientEventInclusions':
+            case 'event-inclusions':
+                $userId = isset($_GET['user_id']) ? intval($_GET['user_id']) : 0;
+                $eventId = isset($_GET['event_id']) ? intval($_GET['event_id']) : 0;
+
+                if ($userId > 0 && $eventId > 0) {
+                    echo json_encode(getClientEventInclusions($userId, $eventId));
+                } else {
+                    echo json_encode([
+                        "status" => "error",
+                        "message" => "User ID and Event ID are required"
                     ]);
                 }
                 break;
