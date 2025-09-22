@@ -36,6 +36,9 @@ if (file_exists($autoloadPath)) {
 // Use shared DB connection (es_v3) and error handling
 require_once __DIR__ . '/db_connect.php';
 
+// Include WebSocket notification pusher
+require_once __DIR__ . '/websocket/push_notification.php';
+
 class NotificationManager
 {
     private $pdo;
@@ -307,6 +310,9 @@ class NotificationManager
 
             $notificationId = $this->pdo->lastInsertId();
 
+            // Send real-time notification via WebSocket
+            $this->sendRealTimeNotification($data, $notificationId);
+
             return [
                 'status' => 'success',
                 'message' => 'Notification created successfully',
@@ -317,6 +323,42 @@ class NotificationManager
                 'status' => 'error',
                 'message' => 'Failed to create notification: ' . $e->getMessage()
             ];
+        }
+    }
+
+    /**
+     * Send real-time notification via WebSocket
+     */
+    private function sendRealTimeNotification($data, $notificationId)
+    {
+        try {
+            // Prepare notification data for WebSocket
+            $wsData = [
+                'user_id' => $data['user_id'],
+                'notification_id' => $notificationId,
+                'title' => $data['title'],
+                'message' => $data['message'],
+                'type' => $data['type'] ?? 'general',
+                'priority' => $data['priority'] ?? 'medium',
+                'icon' => $data['icon'] ?? null,
+                'url' => $data['url'] ?? null,
+                'timestamp' => date('Y-m-d H:i:s')
+            ];
+
+            // Add optional contextual data if present
+            foreach (['event_id', 'booking_id', 'venue_id', 'store_id', 'budget_id', 'feedback_id'] as $field) {
+                if (!empty($data[$field])) {
+                    $wsData[$field] = $data[$field];
+                }
+            }
+
+            // Send to WebSocket server via ZeroMQ
+            NotificationPusher::send($wsData);
+
+            return true;
+        } catch (Exception $e) {
+            error_log('Error sending real-time notification: ' . $e->getMessage());
+            return false;
         }
     }
 

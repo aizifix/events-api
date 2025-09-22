@@ -265,7 +265,7 @@ function createBooking($data) {
         error_log("createBooking: Received data: " . json_encode($data));
 
         // Validate required fields
-        $requiredFields = ['user_id', 'event_type_id', 'event_name', 'event_date', 'event_time', 'guest_count'];
+        $requiredFields = ['user_id', 'event_type_id', 'event_name', 'event_date', 'guest_count'];
         foreach ($requiredFields as $field) {
             if (!isset($data[$field]) || $data[$field] === '' || $data[$field] === null) {
                 return ["status" => "error", "message" => "Missing required field: " . $field];
@@ -291,7 +291,7 @@ function createBooking($data) {
         }
 
         // Validate time format
-        if (!preg_match('/^\d{2}:\d{2}$/', $data['event_time'])) {
+        if (isset($data['event_time']) && !preg_match('/^\d{2}:\d{2}$/', $data['event_time'])) {
             return ["status" => "error", "message" => "Invalid time format. Use HH:MM"];
         }
 
@@ -306,6 +306,11 @@ function createBooking($data) {
 
         // Get current timestamp for booking creation
         $createdAt = date('Y-m-d H:i:s');
+
+        // Process custom and removed components if provided
+        $customComponents = isset($data['custom_components']) ? $data['custom_components'] : [];
+        $removedComponents = isset($data['removed_components']) ? $data['removed_components'] : [];
+        $totalPrice = isset($data['total_price']) ? $data['total_price'] : null;
 
         // Check if the new columns exist in the table
         $columnCheckSql = "SHOW COLUMNS FROM tbl_bookings LIKE 'start_time'";
@@ -325,8 +330,8 @@ function createBooking($data) {
         // Build SQL query based on available columns
         if ($hasNewColumns) {
             // Use new schema with enhanced columns
-            $columns = "booking_reference, user_id, event_type_id, event_name, event_date, event_time, start_time, end_time, guest_count, venue_id, package_id, notes, booking_status";
-            $values = ":booking_reference, :user_id, :event_type_id, :event_name, :event_date, :event_time, :start_time, :end_time, :guest_count, :venue_id, :package_id, :notes, :booking_status";
+            $columns = "booking_reference, user_id, event_type_id, event_name, event_date, start_time, end_time, guest_count, venue_id, package_id, notes, booking_status";
+            $values = ":booking_reference, :user_id, :event_type_id, :event_name, :event_date, :start_time, :end_time, :guest_count, :venue_id, :package_id, :notes, :booking_status";
 
             if ($hasCreatedAt) {
                 $columns .= ", created_at";
@@ -336,8 +341,8 @@ function createBooking($data) {
             $sql = "INSERT INTO tbl_bookings ($columns) VALUES ($values)";
         } else {
             // Use legacy schema without new columns
-            $columns = "booking_reference, user_id, event_type_id, event_name, event_date, event_time, guest_count, venue_id, package_id, notes";
-            $values = ":booking_reference, :user_id, :event_type_id, :event_name, :event_date, :event_time, :guest_count, :venue_id, :package_id, :notes";
+            $columns = "booking_reference, user_id, event_type_id, event_name, event_date, guest_count, venue_id, package_id, notes";
+            $values = ":booking_reference, :user_id, :event_type_id, :event_name, :event_date, :guest_count, :venue_id, :package_id, :notes";
 
             if ($hasCreatedAt) {
                 $columns .= ", created_at";
@@ -347,13 +352,13 @@ function createBooking($data) {
             $sql = "INSERT INTO tbl_bookings ($columns) VALUES ($values)";
         }
 
+        $eventTime = $data['event_time'] ?? '00:00';
         $stmt = $pdo->prepare($sql);
         $stmt->bindParam(':booking_reference', $bookingReference, PDO::PARAM_STR);
         $stmt->bindParam(':user_id', $data['user_id'], PDO::PARAM_INT);
         $stmt->bindParam(':event_type_id', $data['event_type_id'], PDO::PARAM_INT);
         $stmt->bindParam(':event_name', $data['event_name'], PDO::PARAM_STR);
         $stmt->bindParam(':event_date', $data['event_date'], PDO::PARAM_STR);
-        $stmt->bindParam(':event_time', $data['event_time'], PDO::PARAM_STR);
         $stmt->bindParam(':guest_count', $data['guest_count'], PDO::PARAM_INT);
 
         // Handle nullable venue_id and package_id
@@ -398,6 +403,47 @@ function createBooking($data) {
         error_log("createBooking: Executing SQL with reference: " . $bookingReference);
         $stmt->execute();
         $bookingId = $pdo->lastInsertId();
+
+        // Save booking component modifications to special fields in JSON format
+        if (!empty($customComponents) || !empty($removedComponents)) {
+            // Store component changes as JSON in booking notes
+            $componentChanges = [
+                'custom_components' => $customComponents,
+                'removed_components' => $removedComponents
+            ];
+
+            $componentChangesJson = json_encode($componentChanges);
+
+            // Update booking with component changes in the notes field
+            $updateBookingSql = "UPDATE tbl_bookings
+                                SET component_changes = ?
+                                WHERE booking_id = ?";
+
+            // First check if component_changes column exists
+            $columnCheckSql = "SHOW COLUMNS FROM tbl_bookings LIKE 'component_changes'";
+            $columnCheckStmt = $pdo->prepare($columnCheckSql);
+            $columnCheckStmt->execute();
+
+            if ($columnCheckStmt->rowCount() > 0) {
+                // Column exists, update it
+                $updateBookingStmt = $pdo->prepare($updateBookingSql);
+                $updateBookingStmt->execute([$componentChangesJson, $bookingId]);
+            } else {
+                // Column doesn't exist, append to notes instead
+                $updateBookingSql = "UPDATE tbl_bookings
+                                   SET notes = CONCAT(notes, '\nComponent changes: ', ?)
+                                   WHERE booking_id = ?";
+                $updateBookingStmt = $pdo->prepare($updateBookingSql);
+                $updateBookingStmt->execute([$componentChangesJson, $bookingId]);
+            }
+        }
+
+        // Save total price if provided
+        if ($totalPrice !== null) {
+            $updateTotalSql = "UPDATE tbl_bookings SET total_price = ? WHERE booking_id = ?";
+            $updateTotalStmt = $pdo->prepare($updateTotalSql);
+            $updateTotalStmt->execute([$totalPrice, $bookingId]);
+        }
 
         // Create notifications (admin recipients and client) - non-blocking
         try {
@@ -637,6 +683,7 @@ function getClientEvents($userId) {
     try {
         $sql = "SELECT e.*,
                 CONCAT(a.user_firstName, ' ', a.user_lastName) as admin_name,
+                CONCAT(org.user_firstName, ' ', org.user_lastName) as organizer_name,
                 et.event_name as event_type_name,
                 v.venue_title as venue_name,
                 p.package_title as package_name,
@@ -644,6 +691,7 @@ function getClientEvents($userId) {
                 COUNT(pay.payment_id) as payment_count
                 FROM tbl_events e
                 LEFT JOIN tbl_users a ON e.admin_id = a.user_id
+                LEFT JOIN tbl_users org ON e.organizer_id = org.user_id
                 LEFT JOIN tbl_event_type et ON e.event_type_id = et.event_type_id
                 LEFT JOIN tbl_venue v ON e.venue_id = v.venue_id
                 LEFT JOIN tbl_packages p ON e.package_id = p.package_id
@@ -1170,6 +1218,99 @@ function checkEventConflicts($eventDate, $startTime, $endTime, $excludeEventId =
     }
 }
 
+// Function to get all available package components for client selection
+function getAllPackageComponents() {
+    global $pdo;
+
+    try {
+        $sql = "SELECT
+                    pc.component_id,
+                    pc.component_name,
+                    pc.component_description,
+                    pc.component_price,
+                    pc.display_order
+                FROM tbl_package_components pc
+                GROUP BY pc.component_id
+                ORDER BY pc.component_name ASC";
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute();
+        $components = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        return ["status" => "success", "components" => $components];
+    } catch (PDOException $e) {
+        return ["status" => "error", "message" => "Database error: " . $e->getMessage()];
+    }
+}
+
+// Function to get package components by package ID
+function getPackageComponents($packageId) {
+    global $pdo;
+
+    try {
+        // Verify the package exists
+        $verifySql = "SELECT COUNT(*) FROM tbl_packages WHERE package_id = ?";
+        $verifyStmt = $pdo->prepare($verifySql);
+        $verifyStmt->execute([$packageId]);
+
+        if ($verifyStmt->fetchColumn() == 0) {
+            return ["status" => "error", "message" => "Package not found"];
+        }
+
+        // Get all components associated with this package
+        $sql = "SELECT
+                    pc.component_id,
+                    pc.component_name,
+                    pc.component_description,
+                    pc.component_price,
+                    pc.display_order
+                FROM tbl_package_components pc
+                WHERE pc.package_id = ?
+                ORDER BY pc.display_order ASC, pc.component_name ASC";
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$packageId]);
+        $components = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        return [
+            "status" => "success",
+            "package_id" => $packageId,
+            "components" => $components
+        ];
+    } catch (PDOException $e) {
+        return ["status" => "error", "message" => "Database error: " . $e->getMessage()];
+    }
+}
+
+// Function to get all suppliers
+function getAllSuppliers() {
+    global $pdo;
+
+    try {
+        $sql = "SELECT
+                    supplier_id,
+                    business_name as supplier_name,
+                    supplier_type,
+                    supplier_email,
+                    specialty_category,
+                    AVG(rating) as rating_average,
+                    COUNT(review_id) as total_ratings
+                FROM tbl_suppliers s
+                LEFT JOIN tbl_supplier_reviews sr ON s.supplier_id = sr.supplier_id
+                WHERE s.is_verified = 1
+                GROUP BY s.supplier_id
+                ORDER BY business_name ASC";
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute();
+        $suppliers = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        return ["status" => "success", "suppliers" => $suppliers];
+    } catch (PDOException $e) {
+        return ["status" => "error", "message" => "Database error: " . $e->getMessage()];
+    }
+}
+
 // Function to get calendar conflict data for heat map
 function getCalendarConflictData($startDate, $endDate) {
     global $pdo;
@@ -1391,6 +1532,64 @@ function uploadProfilePicture($file, $userId) {
     }
 }
 
+// Function to get venue-specific inclusions
+function getVenueInclusions($venueId) {
+    global $pdo;
+
+    try {
+        $sql = "SELECT vi.inclusion_id, vi.inclusion_name, vi.inclusion_description, vi.inclusion_price
+                FROM tbl_venue_inclusions vi
+                WHERE vi.venue_id = :venue_id AND vi.is_active = 1
+                ORDER BY vi.inclusion_name ASC";
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->bindParam(':venue_id', $venueId, PDO::PARAM_INT);
+        $stmt->execute();
+        $inclusions = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        return ["status" => "success", "inclusions" => $inclusions];
+    } catch (PDOException $e) {
+        return ["status" => "error", "message" => "Database error: " . $e->getMessage()];
+    }
+}
+
+function getSuppliersWithTiers() {
+    global $pdo;
+
+    try {
+        $sql = "SELECT
+                    s.supplier_id,
+                    s.business_name as supplier_name,
+                    s.specialty_category as supplier_category
+                FROM tbl_suppliers s
+                WHERE s.is_active = 1 AND s.is_verified = 1
+                ORDER BY s.business_name ASC";
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute();
+        $suppliers = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        foreach ($suppliers as &$supplier) {
+            $offersSql = "SELECT
+                            offer_id as service_id,
+                            offer_title as service_name,
+                            offer_description as service_description,
+                            price_min as service_price
+                          FROM tbl_supplier_offers
+                          WHERE supplier_id = ? AND is_active = 1
+                          ORDER BY price_min ASC";
+
+            $offersStmt = $pdo->prepare($offersSql);
+            $offersStmt->execute([$supplier['supplier_id']]);
+            $supplier['services'] = $offersStmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+
+        return ["status" => "success", "suppliers" => $suppliers];
+    } catch (PDOException $e) {
+        return ["status" => "error", "message" => "Database error: " . $e->getMessage()];
+    }
+}
+
 // Handle request
 handleCors();
 
@@ -1598,6 +1797,26 @@ switch ($method) {
                 echo json_encode(getAllPackages());
                 break;
 
+            case 'getAllPackageComponents':
+                echo json_encode(getAllPackageComponents());
+                break;
+
+            case 'getPackageComponents':
+                $packageId = isset($_GET['package_id']) ? intval($_GET['package_id']) : 0;
+                if ($packageId > 0) {
+                    echo json_encode(getPackageComponents($packageId));
+                } else {
+                    echo json_encode([
+                        "status" => "error",
+                        "message" => "Package ID is required"
+                    ]);
+                }
+                break;
+
+            case 'getAllSuppliers':
+                echo json_encode(getAllSuppliers());
+                break;
+
             case 'getUserProfile':
                 $userId = isset($_GET['user_id']) ? intval($_GET['user_id']) : 0;
 
@@ -1609,6 +1828,19 @@ switch ($method) {
                         "message" => "User ID is required"
                     ]);
                 }
+                break;
+
+            case 'getVenueInclusions':
+                $venueId = isset($_GET['venue_id']) ? intval($_GET['venue_id']) : 0;
+                if ($venueId > 0) {
+                    echo json_encode(getVenueInclusions($venueId));
+                } else {
+                    echo json_encode(["status" => "error", "message" => "Venue ID is required"]);
+                }
+                break;
+
+            case 'getSuppliersWithTiers':
+                echo json_encode(getSuppliersWithTiers());
                 break;
 
             default:
