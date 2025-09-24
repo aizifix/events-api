@@ -273,7 +273,63 @@ class Auth {
             return json_encode(["status" => "error", "message" => "Account is " . $user['account_status'] . ". Please contact support."]);
         }
 
-        // Generate and send OTP
+        // Check website setting for OTP requirement
+        try {
+            $settingsStmt = $this->conn->prepare("SELECT require_otp_on_login FROM tbl_website_settings ORDER BY setting_id DESC LIMIT 1");
+            $settingsStmt->execute();
+            $settings = $settingsStmt->fetch(PDO::FETCH_ASSOC);
+            $requireOtpOnLogin = isset($settings['require_otp_on_login']) ? (int)$settings['require_otp_on_login'] === 1 : true; // default to true
+        } catch (Exception $e) {
+            $requireOtpOnLogin = true;
+        }
+
+        if (!$requireOtpOnLogin) {
+            // Proceed with direct login (no OTP)
+            // Update last login timestamp
+            $this->conn->prepare("UPDATE tbl_users SET last_login = NOW() WHERE user_id = :user_id")
+                ->execute([':user_id' => $user['user_id']]);
+
+            // Log successful login using ActivityLogger
+            if ($this->logger) {
+                $this->logger->logAuth(
+                    $user['user_id'],
+                    'login',
+                    "User {$user['user_firstName']} {$user['user_lastName']} logged in successfully (OTP disabled)",
+                    $user['user_role'],
+                    true
+                );
+            }
+
+            // Log supplier activity if user is a supplier
+            if ($user['user_role'] === 'supplier') {
+                $this->logSupplierLogin($user['user_id']);
+            }
+
+            // Prepare user data
+            $user['user_role'] = ucfirst(strtolower($user['user_role']));
+            unset($user['user_pwd']);
+
+            $response = [
+                "status" => "success",
+                "message" => "Login successful!",
+                "user" => $user,
+                "force_password_change" => isset($user['force_password_change']) && $user['force_password_change'] == 1
+            ];
+
+            // If supplier role, get additional supplier info
+            if ($user['user_role'] === 'Supplier') {
+                $supplierStmt = $this->conn->prepare("SELECT supplier_id, business_name, onboarding_status FROM tbl_suppliers WHERE user_id = :user_id AND is_active = 1");
+                $supplierStmt->execute([':user_id' => $user['user_id']]);
+                $supplier = $supplierStmt->fetch(PDO::FETCH_ASSOC);
+                if ($supplier) {
+                    $response['supplier_info'] = $supplier;
+                }
+            }
+
+            return json_encode($response);
+        }
+
+        // Generate and send OTP (when required)
         $otp = str_pad(random_int(100000, 999999), 6, '0', STR_PAD_LEFT);
         $expiresAt = date("Y-m-d H:i:s", strtotime("+5 minutes"));
 
@@ -1184,6 +1240,12 @@ switch ($operation) {
         break;
     case "resend_signup_otp":
         echo $auth->resendSignupOTP($_POST['user_id'] ?? ($jsonData['user_id'] ?? ''), $_POST['email'] ?? ($jsonData['email'] ?? ''));
+        break;
+    case "request_otp":
+        // Allow clients to explicitly request an OTP (e.g., per-user 2FA preference)
+        $uid = $_POST['user_id'] ?? ($jsonData['user_id'] ?? '');
+        $email = $_POST['email'] ?? ($jsonData['email'] ?? '');
+        echo $auth->sendOTP($email, $uid);
         break;
     case "check_email":
         $email = $_POST['email'] ?? ($jsonData['email'] ?? '');

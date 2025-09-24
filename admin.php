@@ -2285,12 +2285,32 @@ This is an automated message. Please do not reply.
             $components = $componentsStmt->fetchAll(PDO::FETCH_ASSOC);
 
             // Transform components into the expected structure for detailed view
+            // Parse component_description into child components so UI can show dropdown per inclusion
             $inclusions = [];
             foreach ($components as $component) {
+                $childComponents = [];
+                $rawDescription = isset($component['component_description']) ? trim((string)$component['component_description']) : '';
+
+                if ($rawDescription !== '') {
+                    // Normalize common delimiters to commas (supports comma, semicolon, newline, bullet)
+                    $normalized = preg_replace('/[\r\n;•]+/u', ',', $rawDescription);
+                    $parts = array_filter(array_map('trim', explode(',', (string)$normalized)), function($p) { return $p !== ''; });
+
+                    foreach ($parts as $part) {
+                        $childComponents[] = [
+                            'name' => $part,
+                            // No per-item pricing stored at this granularity
+                            'price' => 0,
+                            // Frontend expects this key; provide empty list
+                            'subComponents' => [],
+                        ];
+                    }
+                }
+
                 $inclusions[] = [
                     'name' => $component['component_name'],
                     'price' => (float)$component['component_price'],
-                    'components' => [], // For now, components don't have sub-components in this structure
+                    'components' => $childComponents,
                 ];
             }
 
@@ -4582,51 +4602,65 @@ This is an automated message. Please do not reply.
                 }
             }
 
+            // Determine if created_at column exists to safely use time-window checks
+            $createdAtExists = false;
+            try {
+                $colStmt = $this->pdo->prepare("SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_payments' AND COLUMN_NAME = 'created_at' LIMIT 1");
+                $colStmt->execute();
+                $createdAtExists = (bool)$colStmt->fetchColumn();
+            } catch (Exception $ignored) {
+                $createdAtExists = false;
+            }
+
             // Check for accidental duplicate payment within a very short window (same payload)
             // Allow legitimate multiple payments on the same day with same amount/method
-            $dupWindowMinutes = 2; // treat same submissions within 2 minutes as accidental duplicates
-            $duplicateCheckSql = "SELECT payment_id FROM tbl_payments
-                                 WHERE event_id = ?
-                                   AND payment_amount = ?
-                                   AND payment_method = ?
-                                   AND payment_status != 'cancelled'
-                                   AND created_at > DATE_SUB(NOW(), INTERVAL {$dupWindowMinutes} MINUTE)
-                                 LIMIT 1";
-            $duplicateCheckStmt = $this->pdo->prepare($duplicateCheckSql);
-            $duplicateCheckStmt->execute([
-                $data['event_id'],
-                $data['payment_amount'],
-                $data['payment_method']
-            ]);
-            if ($duplicateCheckStmt->fetch(PDO::FETCH_ASSOC)) {
-                $this->pdo->rollback();
-                return json_encode([
-                    "status" => "error",
-                    "message" => "Duplicate payment detected. A similar payment was just recorded for this event. Please wait a moment and try again."
+            if ($createdAtExists) {
+                $dupWindowMinutes = 2; // treat same submissions within 2 minutes as accidental duplicates
+                $duplicateCheckSql = "SELECT payment_id FROM tbl_payments
+                                     WHERE event_id = ?
+                                       AND payment_amount = ?
+                                       AND payment_method = ?
+                                       AND payment_status != 'cancelled'
+                                       AND created_at > DATE_SUB(NOW(), INTERVAL {$dupWindowMinutes} MINUTE)
+                                     LIMIT 1";
+                $duplicateCheckStmt = $this->pdo->prepare($duplicateCheckSql);
+                $duplicateCheckStmt->execute([
+                    $data['event_id'],
+                    $data['payment_amount'],
+                    $data['payment_method']
                 ]);
+                if ($duplicateCheckStmt->fetch(PDO::FETCH_ASSOC)) {
+                    $this->pdo->rollback();
+                    return json_encode([
+                        "status" => "error",
+                        "message" => "Duplicate payment detected. A similar payment was just recorded for this event. Please wait a moment and try again."
+                    ]);
+                }
             }
 
             // Additional check: Prevent multiple payments within 1 minute for same event and exact amount/method
-            $recentWindowMinutes = 1;
-            $recentPaymentCheckSql = "SELECT payment_id FROM tbl_payments
-                                     WHERE event_id = ? AND client_id = ?
-                                       AND payment_amount = ? AND payment_method = ?
-                                       AND created_at > DATE_SUB(NOW(), INTERVAL {$recentWindowMinutes} MINUTE)
-                                       AND payment_status != 'cancelled'
-                                     LIMIT 1";
-            $recentPaymentStmt = $this->pdo->prepare($recentPaymentCheckSql);
-            $recentPaymentStmt->execute([
-                $data['event_id'],
-                $data['client_id'],
-                $data['payment_amount'],
-                $data['payment_method']
-            ]);
-            if ($recentPaymentStmt->fetch(PDO::FETCH_ASSOC)) {
-                $this->pdo->rollback();
-                return json_encode([
-                    "status" => "error",
-                    "message" => "Payment creation too frequent. Please wait a moment before submitting the same amount again."
+            if ($createdAtExists) {
+                $recentWindowMinutes = 1;
+                $recentPaymentCheckSql = "SELECT payment_id FROM tbl_payments
+                                         WHERE event_id = ? AND client_id = ?
+                                           AND payment_amount = ? AND payment_method = ?
+                                           AND created_at > DATE_SUB(NOW(), INTERVAL {$recentWindowMinutes} MINUTE)
+                                           AND payment_status != 'cancelled'
+                                         LIMIT 1";
+                $recentPaymentStmt = $this->pdo->prepare($recentPaymentCheckSql);
+                $recentPaymentStmt->execute([
+                    $data['event_id'],
+                    $data['client_id'],
+                    $data['payment_amount'],
+                    $data['payment_method']
                 ]);
+                if ($recentPaymentStmt->fetch(PDO::FETCH_ASSOC)) {
+                    $this->pdo->rollback();
+                    return json_encode([
+                        "status" => "error",
+                        "message" => "Payment creation too frequent. Please wait a moment before submitting the same amount again."
+                    ]);
+                }
             }
 
             // Handle payment attachments if provided
@@ -5194,6 +5228,7 @@ This is an automated message. Please do not reply.
                     social_facebook VARCHAR(255),
                     social_instagram VARCHAR(255),
                     social_twitter VARCHAR(255),
+                    require_otp_on_login TINYINT(1) NOT NULL DEFAULT 1,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 )";
@@ -5202,6 +5237,18 @@ This is an automated message. Please do not reply.
                 // Insert default settings
                 $insertSql = "INSERT INTO tbl_website_settings (company_name) VALUES ('Event Coordination System')";
                 $this->conn->exec($insertSql);
+            } else {
+                // Ensure the require_otp_on_login column exists (idempotent migration)
+                try {
+                    $colCheck = $this->conn->prepare("SELECT COUNT(*) as count FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = 'tbl_website_settings' AND column_name = 'require_otp_on_login'");
+                    $colCheck->execute();
+                    $hasColumn = $colCheck->fetch(PDO::FETCH_ASSOC)['count'] > 0;
+                    if (!$hasColumn) {
+                        $this->conn->exec("ALTER TABLE tbl_website_settings ADD COLUMN require_otp_on_login TINYINT(1) NOT NULL DEFAULT 1 AFTER social_twitter");
+                    }
+                } catch (Exception $e) {
+                    // ignore if cannot add column
+                }
             }
 
             $sql = "SELECT * FROM tbl_website_settings ORDER BY setting_id DESC LIMIT 1";
@@ -5247,6 +5294,7 @@ This is an automated message. Please do not reply.
                         social_facebook = ?,
                         social_instagram = ?,
                         social_twitter = ?,
+                        require_otp_on_login = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE setting_id = (SELECT MAX(setting_id) FROM (SELECT setting_id FROM tbl_website_settings) as temp)";
 
@@ -5263,7 +5311,8 @@ This is an automated message. Please do not reply.
                 $settings['about_text'],
                 $settings['social_facebook'],
                 $settings['social_instagram'],
-                $settings['social_twitter']
+                $settings['social_twitter'],
+                (isset($settings['require_otp_on_login']) && ($settings['require_otp_on_login'] === 1 || $settings['require_otp_on_login'] === '1' || $settings['require_otp_on_login'] === true)) ? 1 : 0
             ]);
 
             if ($result) {
@@ -6972,19 +7021,66 @@ This is an automated message. Please do not reply.
                 return json_encode(["status" => "error", "message" => "Invalid payment status"]);
             }
 
-            $sql = "UPDATE tbl_event_components
-                    SET payment_status = :payment_status,
-                        payment_date = :payment_date,
-                        payment_notes = :payment_notes
-                    WHERE component_id = :component_id";
+            // Determine if payment_date column exists and whether it allows NULL to avoid SQL errors on older schemas
+            $paymentDateExists = false;
+            $paymentDateNullable = true;
+            try {
+                $colStmt = $this->pdo->prepare("SELECT IS_NULLABLE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tbl_event_components' AND COLUMN_NAME = 'payment_date' LIMIT 1");
+                $colStmt->execute();
+                $nullableFlag = $colStmt->fetchColumn();
+                if ($nullableFlag !== false) {
+                    $paymentDateExists = true;
+                    $paymentDateNullable = (strtoupper((string)$nullableFlag) === 'YES');
+                }
+            } catch (Exception $ignored) {
+                $paymentDateExists = false;
+                $paymentDateNullable = true; // assume safe if we can't detect
+            }
 
-            $stmt = $this->pdo->prepare($sql);
-            $result = $stmt->execute([
-                ':component_id' => $data['component_id'],
-                ':payment_status' => $data['payment_status'],
-                ':payment_date' => $data['payment_status'] === 'paid' ? date('Y-m-d H:i:s') : null,
-                ':payment_notes' => $data['payment_notes'] ?? null
-            ]);
+            $notes = isset($data['payment_notes']) ? (string)$data['payment_notes'] : '';
+            $status = $data['payment_status'];
+            $componentId = (int)$data['component_id'];
+
+            if ($status === 'paid') {
+                if ($paymentDateExists) {
+                    $sql = "UPDATE tbl_event_components
+                            SET payment_status = :payment_status,
+                                payment_date = NOW(),
+                                payment_notes = :payment_notes
+                            WHERE component_id = :component_id";
+                } else {
+                    $sql = "UPDATE tbl_event_components
+                            SET payment_status = :payment_status,
+                                payment_notes = :payment_notes
+                            WHERE component_id = :component_id";
+                }
+                $stmt = $this->pdo->prepare($sql);
+                $result = $stmt->execute([
+                    ':payment_status' => $status,
+                    ':payment_notes' => $notes,
+                    ':component_id' => $componentId
+                ]);
+            } else {
+                // For pending/cancelled: clear date only if column is nullable; otherwise leave as-is
+                if ($paymentDateExists && $paymentDateNullable) {
+                    $sql = "UPDATE tbl_event_components
+                            SET payment_status = :payment_status,
+                                payment_date = NULL,
+                                payment_notes = :payment_notes
+                            WHERE component_id = :component_id";
+                } else {
+                    $sql = "UPDATE tbl_event_components
+                            SET payment_status = :payment_status,
+                                payment_notes = :payment_notes
+                            WHERE component_id = :component_id";
+                }
+                $stmt = $this->pdo->prepare($sql);
+                $result = $stmt->execute([
+                    ':payment_status' => $status,
+                    ':payment_notes' => $notes,
+                    ':component_id' => $componentId
+                ]);
+            }
 
             if ($result) {
                 // Get event details to check if all components are paid
@@ -9999,13 +10095,53 @@ try {
         echo $admin->deleteEventComponent($componentId);
         break;
     case "updateComponentPaymentStatus":
-        echo $admin->updateComponentPaymentStatus($data);
+        try {
+            $result = $admin->updateComponentPaymentStatus($data);
+            // Validate JSON
+            $decoded = json_decode($result, true);
+            if ($decoded === null && json_last_error() !== JSON_ERROR_NONE) {
+                throw new Exception("Invalid JSON response from updateComponentPaymentStatus: " . json_last_error_msg());
+            }
+            if (ob_get_length()) { ob_clean(); }
+            http_response_code(200);
+            echo $result;
+        } catch (Exception $e) {
+            if (ob_get_length()) { ob_clean(); }
+            http_response_code(200);
+            echo json_encode(["status" => "error", "message" => "Failed to update component payment status: " . $e->getMessage()]);
+        }
         break;
     case "updateOrganizerPaymentStatus":
-        echo $admin->updateOrganizerPaymentStatus($data);
+        try {
+            $result = $admin->updateOrganizerPaymentStatus($data);
+            $decoded = json_decode($result, true);
+            if ($decoded === null && json_last_error() !== JSON_ERROR_NONE) {
+                throw new Exception("Invalid JSON response from updateOrganizerPaymentStatus: " . json_last_error_msg());
+            }
+            if (ob_get_length()) { ob_clean(); }
+            http_response_code(200);
+            echo $result;
+        } catch (Exception $e) {
+            if (ob_get_length()) { ob_clean(); }
+            http_response_code(200);
+            echo json_encode(["status" => "error", "message" => "Failed to update organizer payment status: " . $e->getMessage()]);
+        }
         break;
     case "updateVenuePaymentStatus":
-        echo $admin->updateVenuePaymentStatus($data);
+        try {
+            $result = $admin->updateVenuePaymentStatus($data);
+            $decoded = json_decode($result, true);
+            if ($decoded === null && json_last_error() !== JSON_ERROR_NONE) {
+                throw new Exception("Invalid JSON response from updateVenuePaymentStatus: " . json_last_error_msg());
+            }
+            if (ob_get_length()) { ob_clean(); }
+            http_response_code(200);
+            echo $result;
+        } catch (Exception $e) {
+            if (ob_get_length()) { ob_clean(); }
+            http_response_code(200);
+            echo json_encode(["status" => "error", "message" => "Failed to update venue payment status: " . $e->getMessage()]);
+        }
         break;
     case "getEventPaymentStats":
         $eventId = $_GET['event_id'] ?? ($data['event_id'] ?? 0);
